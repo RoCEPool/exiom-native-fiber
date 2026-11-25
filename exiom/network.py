@@ -19,45 +19,33 @@ from exiom.fabric import FabricNode, FABRIC_OK, FABRIC_NODE, FABRIC_NO_RESPONSE,
 
 # Expected Status ----------------------------------------------------------------------------------
 
-def expected_status(topology, routes, src, dst, down=None):
-    """Status of a request from `src` to `dst` when the node `down` is cut from the fabric (static
-    routes, no request in flight when the node is cut)."""
+def expected_status(topology, max_hops, src, dst, down=()):
+    """Status of a request from `src` to `dst` once the routes have followed the nodes and links
+    ``down`` (see ``Topology.distances``): served when a path of at most `max_hops` links is left."""
+    down_nodes = [d for d in down if not isinstance(d, tuple)]
     if src == dst:
         return FABRIC_OK
-    if dst not in routes[src]:
+    if src in down_nodes:
+        return FABRIC_LINK # No link up.
+    if dst >= topology.nodes:
         return FABRIC_NODE
-    if down is None:
-        return FABRIC_OK
-    if src == down:
-        return FABRIC_LINK
-    def crosses(a, b):
-        # Node of the route from a to b that sees the link to the node down (None: route clear).
-        node = a
-        while node != b:
-            peer = topology.peers[(node, routes[node][b])][0]
-            if peer == down:
-                return node
-            node = peer
-        return None
-    node = crosses(src, dst)
-    if node is not None:
-        # Link to the node down: seen by the Requester itself, or by a node on the way.
-        return FABRIC_LINK if node == src else FABRIC_NODE
-    if crosses(dst, src) is not None:
-        # Request executed, response lost on its way back (routes are not always the same both ways).
-        return FABRIC_NO_RESPONSE
+    distance = topology.distances(down).get(src, {}).get(dst)
+    if (distance is None) or (distance > max_hops):
+        return FABRIC_NODE
     return FABRIC_OK
 
 # Fabric Network -----------------------------------------------------------------------------------
 
 class FabricNetwork(LiteXModule):
     """``nodes[n]``: FabricNode of id n. ``link_up[(node, port)]``: state of the link of this port
-    (same Signal on both ends, 1 at reset). ``routes``: {node: {destination: port}} (default:
-    shortest paths of the topology)."""
-    def __init__(self, topology, size, routes=None, **node_kwargs):
+    (same Signal on both ends, 1 at reset). ``costs``: route tables (default: ``topology.costs()``).
+    ``detour``: links a packet may cross beyond the longest shortest path, to go around links or
+    nodes that are down (6 links at most in total)."""
+    def __init__(self, topology, size, costs=None, detour=2, **node_kwargs):
         self.topology = topology
-        self.routes   = routes   = topology.routes() if routes is None else routes
-        self.max_hops = max_hops = topology.max_hops(topology.routes())
+        self.costs    = costs    = topology.costs() if costs is None else costs
+        self.diameter = diameter = topology.max_hops(topology.routes())
+        self.max_hops = max_hops = min(diameter + detour, 6)
         self.nodes    = nodes    = []
         self.link_up  = link_up  = {}
 
@@ -72,7 +60,7 @@ class FabricNetwork(LiteXModule):
             node = FabricNode(n,
                 size       = size,
                 ports      = topology.ports,
-                routes     = routes[n],
+                routes     = costs[n],
                 max_hops   = max_hops,
                 # Ports without cable: link down.
                 link_ready = [link_up.get((n, p), Constant(0)) for p in range(topology.ports)],

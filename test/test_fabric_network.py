@@ -9,9 +9,8 @@
 """
 Fabric networks (exiom/network.py): several nodes, forwarding over several links, credits.
 
-Word-level links. 4 nodes (one group, all connected) and 8 nodes (two groups, up to 3 links
-between two nodes); larger fabrics are simulated with Verilator (test/test_fabric_sim.py), the
-Migen simulator being slow to start on them.
+Word-level links. 4 nodes (one group, all connected), 8 nodes (two groups) and 16 nodes (four
+groups, up to 3 links between two nodes, 5 around a node that is down).
 """
 
 import random
@@ -27,6 +26,9 @@ from exiom.topology import *
 from exiom.network  import *
 
 from test.test_fabric import Memory, request, result, results, write, read, wait
+
+# After the other imports (run_simulation is also exported by litex.gen).
+from test.fabric_sim import run_simulation # Same simulator, starts faster on large designs.
 
 # DUT ----------------------------------------------------------------------------------------------
 
@@ -171,55 +173,85 @@ def hotspot(test, dut, dst=0, writes=6):
     test.assertEqual((yield dut.nodes[dst].responder.requests) - before, 2*writes*(n - 1))
     yield from dut.check_no_drop(test)
 
-def node_down(test, dut, down):
-    """Node cut from the fabric: requests to it or through it end with an error, the others are
-    served; then the node comes back."""
-    n = len(dut.nodes)
-    topology, routes = dut.topology, dut.net.routes
-    def node_generator(src, expect_ok):
+SETTLE = 800 # Cycles for the routes to follow a change (route packets every 64 cycles here).
+
+def degraded(test, dut, down, check=None):
+    """Nodes or links (`down`, see Topology.distances) cut from the fabric: once the routes have
+    followed, requests are served by the paths that are left, and those that cannot be are
+    answered with an error; then everything comes back."""
+    n        = len(dut.nodes)
+    topology = dut.topology
+    def links(d):
+        return [dut.net.link_up[d]] if isinstance(d, tuple) else dut.net.node_links(d)
+    def node_generator(src, down, word):
         def generator():
             node = dut.nodes[src]
-            for dst in range(n):
-                if dst == src:
-                    continue
-                expected = FABRIC_OK if expect_ok else expected_status(topology, routes, src, dst, down)
-                status   = yield from write(node, dst, 8, value(src, dst, 7))
-                test.assertEqual(status, expected, f"{src} -> {dst}")
+            tags = {}
+            dsts = [d for d in range(n) if d != src]
+            while dsts or tags:
+                while dsts and len(tags) < 8:
+                    dst = dsts.pop(0)
+                    tag = yield from request(node, word, we=1, dat_w=value(src, dst, 7), dst=dst)
+                    tags[tag] = dst
+                tag, _, status, _ = yield from result(node)
+                dst = tags.pop(tag)
+                test.assertEqual(status, expected_status(topology, dut.net.max_hops, src, dst, down), f"{src} -> {dst}")
         return generator()
-    for up in node_links_of(dut, down):
-        yield up.eq(0)
-    yield from wait(8)
-    yield from parallel(dut, [node_generator(src, False) for src in range(n)])
-    statuses = [expected_status(topology, routes, s, d, down) for s in range(n) for d in range(n) if s != d]
-    test.assertIn(FABRIC_OK,   statuses)
-    test.assertIn(FABRIC_LINK, statuses)
-    for up in node_links_of(dut, down):
-        yield up.eq(1)
-    yield from wait(8)
-    yield from parallel(dut, [node_generator(src, True) for src in range(n)])
+    statuses = [expected_status(topology, dut.net.max_hops, s, d, down) for s in range(n) for d in range(n) if s != d]
+    if check is not None:
+        check(statuses)
+    forwarded = 0
+    for node in dut.nodes:
+        forwarded -= (yield node.forwarded)
+    for d in down:
+        for up in links(d):
+            yield up.eq(0)
+    yield from wait(SETTLE)
+    yield from parallel(dut, [node_generator(src, down, 8) for src in range(n)])
+    for node in dut.nodes:
+        forwarded += (yield node.forwarded)
+    for d in down:
+        for up in links(d):
+            yield up.eq(1)
+    yield from wait(SETTLE)
+    yield from parallel(dut, [node_generator(src, (), 9) for src in range(n)])
+    return forwarded
 
-def node_links_of(dut, node):
-    return dut.net.node_links(node)
+def node_down(test, dut, down, unreachable=False):
+    def check(statuses):
+        test.assertIn(FABRIC_LINK, statuses)           # From the node.
+        test.assertIn(FABRIC_NODE, statuses)           # To the node.
+        # Other pairs: all served, unless the fabric has no other path.
+        others = len(dut.nodes) - 1
+        test.assertEqual(statuses.count(FABRIC_OK) == others*(others - 1), not unreachable)
+    yield from degraded(test, dut, [down], check)
+
+def link_down(test, dut, link):
+    def check(statuses):
+        test.assertEqual(set(statuses), {FABRIC_OK})   # Everything served around the link.
+    forwarded = yield from degraded(test, dut, [link], check)
+    test.assertGreater(forwarded, 0)
 
 # Test Fabric Network ------------------------------------------------------------------------------
 
 class TestFabricNetwork(unittest.TestCase):
     def test_4_nodes(self):
         dut = DUT(two_tier(4))
-        self.assertEqual(dut.net.max_hops, 1)
+        self.assertEqual((dut.net.diameter, dut.net.max_hops), (1, 3))
         run(dut, [
-            all_to_all(self, dut),
+            all_to_all(self, dut, check_hops=False),
             random_traffic(self, dut),
             hotspot(self, dut),
             node_down(self, dut, down=2),
-            all_to_all(self, dut, salt=1),
+            link_down(self, dut, link=(0, 0)), # Nodes 0 and 1 then talk through another node.
+            all_to_all(self, dut, salt=1, check_hops=False),
         ])
 
     def test_4_nodes_backpressure(self):
         # Smallest buffers, slow memories: no packet dropped, nothing stalls.
         dut = DUT(two_tier(4), buffer_depth=2, queue_depth=1, request_timeout=60000, mem_kwargs=dict(latency=40))
         run(dut, [
-            all_to_all(self, dut),
+            all_to_all(self, dut, check_hops=False),
             random_traffic(self, dut, requests=32),
             hotspot(self, dut),
         ])
@@ -227,23 +259,50 @@ class TestFabricNetwork(unittest.TestCase):
     def test_4_nodes_hypercube(self):
         # Other topology (2 links between opposite nodes): same nodes, other routes.
         dut = DUT(hypercube(4))
-        self.assertEqual(dut.net.max_hops, 2)
+        self.assertEqual((dut.net.diameter, dut.net.max_hops), (2, 4))
         run(dut, [
             all_to_all(self, dut),
             random_traffic(self, dut),
             node_down(self, dut, down=1),
+            link_down(self, dut, link=(0, 0)),
         ])
 
     def test_8_nodes(self):
-        # Two groups of 4, one cable between them (fabric cabled for 16 nodes): up to 3 links.
+        # Two groups of 4 of a fabric cabled for 16 nodes: one cable between the groups, up to 3
+        # links. Without the node that has this cable, the other group cannot be reached.
         dut = DUT(two_tier(8), buffer_depth=2, queue_depth=1, request_timeout=60000, mem_kwargs=dict(latency=20))
-        self.assertEqual(dut.net.max_hops, 3)
+        self.assertEqual((dut.net.diameter, dut.net.max_hops), (3, 5))
         run(dut, [
             all_to_all(self, dut),
             random_traffic(self, dut, requests=16),
             hotspot(self, dut, writes=3),
-            node_down(self, dut, down=6), # Node 6 has the cable to the other group.
+            node_down(self, dut, down=6, unreachable=True),
+            node_down(self, dut, down=5),
             all_to_all(self, dut, salt=1),
+        ])
+
+    def test_8_nodes_two_groups(self):
+        # Fabric cabled for 8 nodes: 4 cables between the two groups. Any node or cable can go,
+        # the others are still served. Route packets in several parts (4 destinations each).
+        dut = DUT(two_tier(8, design_groups=2), route_entries=4)
+        self.assertEqual((dut.net.diameter, dut.net.max_hops), (2, 4))
+        run(dut, [
+            all_to_all(self, dut),
+            node_down(self, dut, down=6),
+            link_down(self, dut, link=(0, 3)), # Cable between the groups.
+            link_down(self, dut, link=(4, 0)), # Cable inside a group.
+            all_to_all(self, dut, salt=1),
+        ])
+
+    def test_16_nodes(self):
+        # Four groups of 4, one cable between each pair of groups, 4 ports per node.
+        dut = DUT(two_tier(16))
+        self.assertEqual((dut.net.diameter, dut.net.max_hops), (3, 5))
+        run(dut, [
+            all_to_all(self, dut),
+            node_down(self, dut, down=6),      # Has the cable between groups 0 and 1: through another group.
+            link_down(self, dut, link=(0, 3)), # This cable alone.
+            random_traffic(self, dut, requests=8),
         ])
 
 if __name__ == "__main__":
