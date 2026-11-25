@@ -501,7 +501,6 @@ class FabricResponder(LiteXModule):
         # Request.
         # --------
         src    = Signal(8)
-        local  = Signal()
         tag    = Signal(8)
         sel    = Signal(4)
         we     = Signal()
@@ -531,30 +530,26 @@ class FabricResponder(LiteXModule):
             sink.ready.eq(1),
             If(sink.valid,
                 NextValue(src,   route_src(sink.w0)),
-                NextValue(local, route_dst(sink.w0) == node_id),
                 NextValue(tag,   sink.w1[0:8]),
                 NextValue(sel,   sink.w1[8:12]),
                 NextValue(we,    sink.w1[12]),
                 NextValue(adr,   sink.w2),
                 NextValue(dat_w, sink.w3),
-                If(sink.len == Mux(sink.w1[12], 4, 3),
-                    NextState("CHECK")
-                ).Else(
+                NextValue(dat_r, 0),
+                If(sink.len != Mux(sink.w1[12], 4, 3),
                     NextValue(malformed, malformed + 1)
+                ).Elif(route_dst(sink.w0) != node_id,
+                    NextValue(status, FABRIC_NODE),
+                    NextState("RESPONSE")
+                ).Elif(sink.w2 >= words,
+                    NextValue(status, FABRIC_RANGE),
+                    NextState("RESPONSE")
+                ).Elif(sink.w1[12] & int(read_only),
+                    NextValue(status, FABRIC_RO),
+                    NextState("RESPONSE")
+                ).Else(
+                    NextState("MEMORY")
                 )
-            )
-        )
-        fsm.act("CHECK",
-            NextValue(dat_r, 0),
-            NextState("RESPONSE"),
-            If(~local,
-                NextValue(status, FABRIC_NODE)
-            ).Elif(adr >= words,
-                NextValue(status, FABRIC_RANGE)
-            ).Elif(we & int(read_only),
-                NextValue(status, FABRIC_RO)
-            ).Else(
-                NextState("MEMORY")
             )
         )
         fsm.act("MEMORY",
@@ -591,7 +586,7 @@ class FabricPort(LiteXModule):
     ``tx_class`` (accepted when the port is free; the switch checks ``credit[tx_class]`` first).
     ``ctl``/``rt``: route packets to send (between two packets, without credit) and received.
     """
-    def __init__(self, max_hops=1, queue_depth=2, fc_period=256, link_ready=None):
+    def __init__(self, max_hops=1, queue_depth=4, fc_period=256, link_ready=None):
         assert 1 <= max_hops <= 6 and 1 <= queue_depth <= 8 and fc_period >= 16
         self.classes  = classes = 2*max_hops
         self.sink     = sink    = stream.Endpoint(packet_description(32))
@@ -748,8 +743,10 @@ class FabricPort(LiteXModule):
         # -----------------------------------------------------------------
         hold       = stream.Endpoint(fabric_packet_layout()) # Packet being sent.
         hold_valid = Signal()
-        # Link down: packets are dropped instead of stalling the node.
-        self.comb += tx.ready.eq(~hold_valid | ~up)
+        packet_done = Signal()
+        # A packet is taken when the previous one leaves. Link down: packets are dropped instead of
+        # stalling the node.
+        self.comb += tx.ready.eq(~hold_valid | packet_done | ~up)
 
         fc_words = [Signal(32, name=f"fc_w{i}") for i in range(4)]
         self.comb += fc_words[0].eq((FABRIC_MAGIC << 28) | (1 << 25))
@@ -762,10 +759,18 @@ class FabricPort(LiteXModule):
         self.dirty_timer = dirty_timer = WaitTimer(fc_period//8) # Places freed: sooner.
         fc_request = Signal()
         fc_sent    = Signal()
+        # Places freed in a class for which the neighbor was told it has none left: it is waiting.
+        rx_l_sent  = [Signal(4, reset=queue_depth, name=f"rx_l_sent{c}") for c in range(classes)]
+        starving   = Signal()
+        self.comb += starving.eq(Cat(*[(rx_l_sent[c] == rx_r[c]) & (rx_l[c] != rx_l_sent[c]) for c in range(classes)]) != 0)
+        self.sync += [
+            If(fc_sent, *[rx_l_sent[c].eq(rx_l[c]) for c in range(classes)]),
+            If(~up,     *[rx_l_sent[c].eq(queue_depth) for c in range(classes)]),
+        ]
         self.comb += [
             fc_timer.wait.eq(~fc_sent),
             dirty_timer.wait.eq(dirty & ~fc_sent),
-            fc_request.eq(fc_timer.done | (dirty & (~hold_valid | dirty_timer.done))),
+            fc_request.eq(fc_timer.done | starving | (dirty & (~hold_valid | dirty_timer.done))),
         ]
         self.sync += [
             If(fc_sent,
@@ -798,6 +803,11 @@ class FabricPort(LiteXModule):
                 NextValue(ctl_len,      ctl.len),
                 NextState("CONTROL")
             ).Elif(hold_valid,
+                # First word of the packet: once presented, the packet is sent before anything else.
+                source.valid.eq(1),
+                source.length.eq(Cat(Constant(0, 2), hold.len)),
+                source.data.eq(hold.w0),
+                If(source.ready, NextValue(index, 1)),
                 NextState("PACKET")
             )
         )
@@ -821,7 +831,6 @@ class FabricPort(LiteXModule):
                 If(source.last, NextState("IDLE"))
             )
         )
-        packet_done = Signal()
         tx_fsm.act("PACKET",
             source.valid.eq(1),
             source.length.eq(Cat(Constant(0, 2), hold.len)),
@@ -869,7 +878,7 @@ class FabricNode(LiteXModule):
         request_timeout = 4096,
         memory_timeout  = 1024,
         buffer_depth    = 4,
-        queue_depth     = 2,
+        queue_depth     = 4,
         fc_period       = 256,
         route_period    = None,
         route_entries   = ROUTE_ENTRIES,
@@ -931,16 +940,30 @@ class FabricNode(LiteXModule):
         # Switch.
         # -------
         # Inputs: packets injected by this node (Responder, Requester) and the queues of the ports.
-        # One input is looked at per cycle; its packet moves when its output can take it, so a
-        # packet that has to wait never blocks the packets of the other inputs.
+        # Each cycle, the next input that has a packet (in turn) is looked at; its packet moves
+        # when its output can take it, so a packet that has to wait never blocks the packets of
+        # the other inputs, and one packet moves per cycle when there are packets to move.
         inputs = [] # (endpoint, port it came from (None: injected), links crossed).
         inputs.append((responder.tx, None, 0))
         inputs.append((requester.tx, None, 0))
         for p, port in enumerate(fports):
             for c, queue in enumerate(port.queues):
                 inputs.append((queue, p, (c % max_hops) + 1))
-        sel = Signal(max=len(inputs))
-        self.sync += If(sel == (len(inputs) - 1), sel.eq(0)).Else(sel.eq(sel + 1))
+        count   = len(inputs)
+        sel     = Signal(max=count)
+        turn    = Signal(max=count) # First input looked at in this cycle.
+        valids  = Signal(count)
+        ahead   = Signal(count)     # Inputs with a packet, from `turn`.
+        self.encoder_ahead = encoder_ahead = PriorityEncoder(count)
+        self.encoder_all   = encoder_all   = PriorityEncoder(count)
+        self.comb += [
+            valids.eq(Cat(*[endpoint.valid for endpoint, _, _ in inputs])),
+            ahead.eq(valids & ~((1 << turn) - 1)),
+            encoder_ahead.i.eq(ahead),
+            encoder_all.i.eq(valids),
+            sel.eq(Mux(encoder_ahead.n, encoder_all.o, encoder_ahead.o)),
+        ]
+        self.sync += If(valids != 0, If(sel == (count - 1), turn.eq(0)).Else(turn.eq(sel + 1)))
 
         # Selected input.
         cur          = stream.Endpoint(fabric_packet_layout())
