@@ -30,8 +30,9 @@ one hardware sequencer per node:
             forwarded over up to 3 links).
 - hotspot : all the nodes write node 0 together.
 - errors  : out of window and unknown node.
-- down    : one node is cut from the fabric: requests to it or through it end with the expected
-            error, the others are served; then the node comes back.
+- down    : one node is cut from the fabric: once the routes have followed, requests to it are
+            answered with an error and the others are served by the paths that are left; then the
+            node comes back.
 
 Displays "FABRIC TEST: PASS" or "FABRIC TEST: FAIL" and ends the simulation (see
 test/test_fabric_sim.py).
@@ -65,7 +66,7 @@ from exiom.network  import FabricNetwork, expected_status
 
 # Scenarios ----------------------------------------------------------------------------------------
 
-WRITE, READ, SYNC, CUT, WAIT_LINK, WAIT_PEER, BARRIER = range(7)
+WRITE, READ, SYNC, CUT, WAIT_LINK, WAIT_PEER, BARRIER, DELAY = range(8)
 
 NODE_A   = 1
 NODE_B   = 2
@@ -159,7 +160,9 @@ NETWORK_SCENARIOS = ["all", "hotspot", "errors", "down"]
 def value(src, dst, salt=0):
     return (0xa5000000 | (salt << 20) | (src << 8) | dst) & 0xffffffff
 
-def network_steps(topology, routes, src, scenarios, down):
+SETTLE = 4096 # Cycles for the routes to follow a change.
+
+def network_steps(topology, max_hops, src, scenarios, down):
     """Steps of the sequencer of node `src`."""
     steps  = Steps(dst=None)
     others = [d for d in range(topology.nodes) if d != src]
@@ -183,10 +186,12 @@ def network_steps(topology, routes, src, scenarios, down):
         steps.step(SYNC)
     if "down" in scenarios:
         steps.step(BARRIER)                      # Node cut when all the nodes are here.
+        steps.step(DELAY, SETTLE)
         for dst in others:
-            steps.write(48, value(src, dst, 5), status=expected_status(topology, routes, src, dst, down), dst=dst)
+            steps.write(48, value(src, dst, 5), status=expected_status(topology, max_hops, src, dst, [down]), dst=dst)
         steps.step(SYNC)
         steps.step(BARRIER)                      # Node back.
+        steps.step(DELAY, SETTLE)
         for dst in others:
             steps.write(64 + src, value(src, dst, 6), dst=dst)
         steps.step(SYNC)
@@ -250,6 +255,7 @@ class Sequencer(LiteXModule):
                 )
             ]
 
+        delay = Signal(32)
         self.fsm = fsm = FSM(reset_state="WAIT-LINK")
         fsm.act("WAIT-LINK",
             If(link_ready,
@@ -265,6 +271,7 @@ class Sequencer(LiteXModule):
                 WAIT_LINK : If(link_ready, *next_step()),
                 WAIT_PEER : If(self.peer_done, *next_step()),
                 BARRIER   : [self.at_barrier.eq(outstanding == 0), If(self.go, *next_step())],
+                DELAY     : [NextValue(delay, delay + 1), If(delay == datas[step], NextValue(delay, 0), *next_step())],
             })
         )
         fsm.act("DONE",
@@ -460,7 +467,7 @@ class FabricNetworkBench(LiteXModule):
             self.add_module(f"sram{n}", sram)
             srams.append(sram)
 
-            seq = Sequencer(node, network_steps(topology, net.routes, n, scenarios, down), self.link_ready)
+            seq = Sequencer(node, network_steps(topology, net.max_hops, n, scenarios, down), self.link_ready)
             self.add_module(f"seq{n}", seq)
             seqs.append(seq)
             self.steps[n] = seq.steps

@@ -22,6 +22,9 @@ from litex.gen.sim import *
 
 from exiom.fabric import *
 
+# After the other imports (run_simulation is also exported by litex.gen).
+from test.fabric_sim import run_simulation # Same simulator, starts faster on large designs.
+
 SIM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bench", "fabric", "sim.py")
 
 def load_sim():
@@ -165,7 +168,7 @@ class TestFabricNetworkBench(unittest.TestCase):
     def test_4_nodes(self):
         sim, dut, results = self.run_bench(nodes=4)
         self.assertEqual(results["was_down"], 1)
-        # Statuses expected with the node cut: served, link down (to the node), and from the node.
+        # Statuses expected: served, from the node cut (no link), to it or unknown (no route).
         statuses = set(s[4] for n in range(4) for s in dut.steps[n] if s[0] == sim.WRITE)
         self.assertTrue({FABRIC_OK, FABRIC_LINK, FABRIC_RANGE, FABRIC_NODE} <= statuses)
 
@@ -173,12 +176,12 @@ class TestFabricNetworkBench(unittest.TestCase):
         self.run_bench(nodes=4, sram_latency=20, queue_depth=1, buffer_depth=2)
 
     def test_4_nodes_hypercube(self):
-        # Requests forwarded by a node (2 links), and responses lost on their way back through
-        # the node cut.
+        # Requests forwarded by a node (2 links), and going around the node cut.
         sim, dut, results = self.run_bench(nodes=4, topology="hypercube")
         self.assertGreater(results["forwarded"], 0)
-        statuses = set(s[4] for n in range(4) for s in dut.steps[n] if s[0] == sim.WRITE)
-        self.assertIn(FABRIC_NO_RESPONSE, statuses)
+        statuses = [s[4] for n in range(4) for s in dut.steps[n] if s[0] == sim.WRITE and s[2] == 48]
+        # With the node cut: 3 requests from it, 3 to it, and the 6 others served.
+        self.assertEqual(sorted(statuses), sorted([FABRIC_LINK]*3 + [FABRIC_NODE]*3 + [FABRIC_OK]*6))
 
 if __name__ == "__main__":
     unittest.main()
