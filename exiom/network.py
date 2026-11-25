@@ -1,0 +1,92 @@
+#
+# This file is part of exiom-native-fiber.
+#
+# Copyright (c) 2026 RoCEPool
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Fabric network: the nodes of a topology and their links (simulation and test benches).
+
+Links are direct connections of the packet streams of the ports (word-level, no PHY model): the
+bit-level SerWB link is exercised by the two-node benches.
+"""
+
+from migen import *
+
+from litex.gen import *
+
+from exiom.fabric import FabricNode, FABRIC_OK, FABRIC_NODE, FABRIC_NO_RESPONSE, FABRIC_LINK
+
+# Expected Status ----------------------------------------------------------------------------------
+
+def expected_status(topology, routes, src, dst, down=None):
+    """Status of a request from `src` to `dst` when the node `down` is cut from the fabric (static
+    routes, no request in flight when the node is cut)."""
+    if src == dst:
+        return FABRIC_OK
+    if dst not in routes[src]:
+        return FABRIC_NODE
+    if down is None:
+        return FABRIC_OK
+    if src == down:
+        return FABRIC_LINK
+    def crosses(a, b):
+        # Node of the route from a to b that sees the link to the node down (None: route clear).
+        node = a
+        while node != b:
+            peer = topology.peers[(node, routes[node][b])][0]
+            if peer == down:
+                return node
+            node = peer
+        return None
+    node = crosses(src, dst)
+    if node is not None:
+        # Link to the node down: seen by the Requester itself, or by a node on the way.
+        return FABRIC_LINK if node == src else FABRIC_NODE
+    if crosses(dst, src) is not None:
+        # Request executed, response lost on its way back (routes are not always the same both ways).
+        return FABRIC_NO_RESPONSE
+    return FABRIC_OK
+
+# Fabric Network -----------------------------------------------------------------------------------
+
+class FabricNetwork(LiteXModule):
+    """``nodes[n]``: FabricNode of id n. ``link_up[(node, port)]``: state of the link of this port
+    (same Signal on both ends, 1 at reset). ``routes``: {node: {destination: port}} (default:
+    shortest paths of the topology)."""
+    def __init__(self, topology, size, routes=None, **node_kwargs):
+        self.topology = topology
+        self.routes   = routes   = topology.routes() if routes is None else routes
+        self.max_hops = max_hops = topology.max_hops(topology.routes())
+        self.nodes    = nodes    = []
+        self.link_up  = link_up  = {}
+
+        # # #
+
+        for a, b in topology.links:
+            up = Signal(reset=1, name=f"link_n{a[0]}p{a[1]}_n{b[0]}p{b[1]}_up")
+            link_up[a] = up
+            link_up[b] = up
+
+        for n in range(topology.nodes):
+            node = FabricNode(n,
+                size       = size,
+                ports      = topology.ports,
+                routes     = routes[n],
+                max_hops   = max_hops,
+                # Ports without cable: link down.
+                link_ready = [link_up.get((n, p), Constant(0)) for p in range(topology.ports)],
+                **node_kwargs,
+            )
+            self.add_module(f"node{n}", node)
+            nodes.append(node)
+
+        for (na, pa), (nb, pb) in topology.links:
+            self.comb += [
+                nodes[na].ports[pa].source.connect(nodes[nb].ports[pb].sink),
+                nodes[nb].ports[pb].source.connect(nodes[na].ports[pa].sink),
+            ]
+
+    def node_links(self, node):
+        """Link state Signals of a node (to take a node down)."""
+        return [up for (n, _), up in self.link_up.items() if n == node]
