@@ -7,7 +7,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Fabric end-to-end simulation: two symmetric nodes, one SerWB link, tagged requests in flight.
+Fabric end-to-end simulations.
+
+Two nodes (default), one SerWB link:
 
     Sequencer A -> FabricNode A -> SERWBCore -> SERWBPHY <-wires-> SERWBPHY -> SERWBCore -> FabricNode B <- Sequencer B
                    + SRAM A                                                              + SRAM B
@@ -20,6 +22,16 @@ against its request:
             each other at the same time.
 - errors  : out of window, memory not answering and unknown node, in flight with valid requests.
 - link    : wires cut with requests in flight, link retrained, requests served again.
+
+Network (--nodes 4, 8, 16...): the nodes of a topology (two-tier by default) with word-level links,
+one hardware sequencer per node:
+
+- all     : every node writes one word in every other node, then reads it (requests in flight,
+            forwarded over up to 3 links).
+- hotspot : all the nodes write node 0 together.
+- errors  : out of window and unknown node.
+- down    : one node is cut from the fabric: requests to it or through it end with the expected
+            error, the others are served; then the node comes back.
 
 Displays "FABRIC TEST: PASS" or "FABRIC TEST: FAIL" and ends the simulation (see
 test/test_fabric_sim.py).
@@ -47,11 +59,13 @@ from litex.soc.integration.builder import *
 from liteiclink.serwb.genphy import SERWBPHY
 from liteiclink.serwb.core   import SERWBCore
 
-from exiom.fabric import *
+from exiom.fabric   import *
+from exiom.topology import two_tier, hypercube
+from exiom.network  import FabricNetwork, expected_status
 
 # Scenarios ----------------------------------------------------------------------------------------
 
-WRITE, READ, SYNC, CUT, WAIT_LINK, WAIT_PEER = range(6)
+WRITE, READ, SYNC, CUT, WAIT_LINK, WAIT_PEER, BARRIER = range(7)
 
 NODE_A   = 1
 NODE_B   = 2
@@ -137,6 +151,50 @@ def scenario_steps_b(scenarios):
 
 SCENARIOS = ["normal", "errors", "link"]
 
+# Network Scenarios --------------------------------------------------------------------------------
+
+NETWORK_SIZE      = 512 # Window of each node (128 words).
+NETWORK_SCENARIOS = ["all", "hotspot", "errors", "down"]
+
+def value(src, dst, salt=0):
+    return (0xa5000000 | (salt << 20) | (src << 8) | dst) & 0xffffffff
+
+def network_steps(topology, routes, src, scenarios, down):
+    """Steps of the sequencer of node `src`."""
+    steps  = Steps(dst=None)
+    others = [d for d in range(topology.nodes) if d != src]
+    if "all" in scenarios:
+        for dst in others:
+            steps.write(src, value(src, dst), dst=dst)
+        steps.step(SYNC)
+        for dst in others:
+            steps.read(src, value(src, dst), dst=dst)
+        steps.step(SYNC)
+    if "hotspot" in scenarios and src != 0:
+        for i in range(4):                       # In flight, executed in order.
+            steps.write(32 + src, value(src, 0, 1 + i), dst=0)
+        steps.step(SYNC)
+        steps.read(32 + src, value(src, 0, 4), dst=0)
+        steps.step(SYNC)
+    if "errors" in scenarios:
+        steps.write(200, 0xdead0001, status=FABRIC_RANGE, dst=others[0])
+        steps.write(1,   0xdead0002, status=FABRIC_NODE,  dst=200)
+        steps.read( src, value(src, others[-1]) if "all" in scenarios else 0, dst=others[-1])
+        steps.step(SYNC)
+    if "down" in scenarios:
+        steps.step(BARRIER)                      # Node cut when all the nodes are here.
+        for dst in others:
+            steps.write(48, value(src, dst, 5), status=expected_status(topology, routes, src, dst, down), dst=dst)
+        steps.step(SYNC)
+        steps.step(BARRIER)                      # Node back.
+        for dst in others:
+            steps.write(64 + src, value(src, dst, 6), dst=dst)
+        steps.step(SYNC)
+        for dst in others:
+            steps.read(64 + src, value(src, dst, 6), dst=dst)
+        steps.step(SYNC)
+    return steps
+
 # Sequencer ----------------------------------------------------------------------------------------
 
 class Sequencer(LiteXModule):
@@ -149,6 +207,8 @@ class Sequencer(LiteXModule):
         self.results     = Signal(32) # Results checked.
         self.link_cut    = Signal()
         self.peer_done   = Signal()
+        self.at_barrier  = Signal()
+        self.go          = Signal()
 
         # # #
 
@@ -204,12 +264,14 @@ class Sequencer(LiteXModule):
                 CUT       : [NextValue(self.link_cut, datas[step][0])] + next_step(),
                 WAIT_LINK : If(link_ready, *next_step()),
                 WAIT_PEER : If(self.peer_done, *next_step()),
+                BARRIER   : [self.at_barrier.eq(outstanding == 0), If(self.go, *next_step())],
             })
         )
         fsm.act("DONE",
             self.done.eq(outstanding == 0)
         )
         self.sync += If(sent, slot_steps[requester.tag[:slot_bits]].eq(step))
+        self.comb += If(fsm.ongoing("DONE") & (outstanding == 0), self.at_barrier.eq(1))
 
         # Results.
         # --------
@@ -280,8 +342,10 @@ class FabricTestBench(LiteXModule):
             node = FabricNode(node_id,
                 size            = SIZE,
                 requests        = REQUESTS,
-                request_timeout = 16384,
+                request_timeout = 32768,
                 memory_timeout  = 256,
+                # Flow control packets take 5 words on the link (200 cycles with the bit-level PHY).
+                fc_period       = 2048,
                 link_ready      = phy.init.ready,
             )
             node.connect_serwb(core)
@@ -333,6 +397,103 @@ class FabricTestBench(LiteXModule):
         self.sync += self.cycles.eq(self.cycles + 1)
         self.comb += self.timeout.eq(self.cycles == timeout)
 
+# Fabric Network Bench -----------------------------------------------------------------------------
+
+class FabricNetworkBench(LiteXModule):
+    """The nodes of a topology (word-level links) and one self-checking sequencer per node."""
+    def __init__(self, nodes=4, topology="two_tier", scenarios=NETWORK_SCENARIOS, down=None, sram_latency=0,
+        queue_depth=2, buffer_depth=4, timeout=4000000):
+        self.done        = Signal()
+        self.errors      = Signal(32)
+        self.failed_node = Signal(8)
+        self.failed_step = Signal(16)
+        self.cycles      = Signal(32)
+        self.link_ready  = Signal(reset=1)
+        self.timeout     = Signal()
+        self.node_down   = Signal()
+
+        # # #
+
+        self.topology = topology = {"two_tier": two_tier, "hypercube": hypercube}[topology](nodes)
+        if "down" in scenarios:
+            # Default: the node with the most links (in a two-tier fabric, one with a cable to
+            # another group).
+            if down is None:
+                down = max(range(nodes), key=lambda n: (topology.ports_used(n), n))
+        else:
+            down = None
+        self.down = down
+
+        # Network ------------------------------------------------------------------------------
+        self.net = net = FabricNetwork(topology,
+            size            = NETWORK_SIZE,
+            requests        = REQUESTS,
+            request_timeout = 16384,
+            memory_timeout  = 256,
+            queue_depth     = queue_depth,
+            buffer_depth    = buffer_depth,
+        )
+        if down is not None:
+            for up in net.node_links(down):
+                self.comb += up.eq(~self.node_down)
+
+        # Memories and sequencers -----------------------------------------------------------------
+        self.srams = srams = []
+        self.seqs  = seqs  = []
+        self.steps = {}
+        for n, node in enumerate(net.nodes):
+            sram  = wishbone.SRAM(NETWORK_SIZE)
+            mem   = node.responder.mem
+            count = Signal(max=sram_latency + 2)
+            self.comb += [
+                mem.connect(sram.bus, omit={"stb", "ack"}),
+                sram.bus.stb.eq(mem.stb & (count == sram_latency)),
+                mem.ack.eq(sram.bus.ack),
+            ]
+            self.sync += [
+                If(~(mem.cyc & mem.stb) | mem.ack,
+                    count.eq(0)
+                ).Elif(count != sram_latency,
+                    count.eq(count + 1)
+                )
+            ]
+            self.add_module(f"sram{n}", sram)
+            srams.append(sram)
+
+            seq = Sequencer(node, network_steps(topology, net.routes, n, scenarios, down), self.link_ready)
+            self.add_module(f"seq{n}", seq)
+            seqs.append(seq)
+            self.steps[n] = seq.steps
+
+        # Barriers: all the sequencers go on together; the node is cut after the first one and back
+        # after the second one.
+        go       = Signal()
+        barriers = Signal(2)
+        self.sync += [
+            go.eq(0),
+            If(Cat(*[seq.at_barrier for seq in seqs]) == (2**nodes - 1),
+                If(~go & ~self.done,
+                    go.eq(1),
+                    barriers.eq(barriers + 1),
+                )
+            )
+        ]
+        self.comb += [seq.go.eq(go) for seq in seqs]
+        self.comb += self.node_down.eq(barriers == 1)
+
+        # Results --------------------------------------------------------------------------------
+        self.comb += [
+            self.done.eq(Cat(*[seq.done for seq in seqs]) == (2**nodes - 1)),
+            self.errors.eq(sum(seq.errors for seq in seqs)),
+        ]
+        for n, seq in reversed(list(enumerate(seqs))):
+            self.comb += If(seq.errors != 0,
+                self.failed_node.eq(n),
+                self.failed_step.eq(seq.failed_step),
+            )
+        self.sync += self.cycles.eq(self.cycles + 1)
+        self.comb += self.timeout.eq(self.cycles == timeout)
+
 # IOs ----------------------------------------------------------------------------------------------
 
 _io = [
@@ -349,7 +510,7 @@ class Platform(SimPlatform):
 # FabricTestSoC ------------------------------------------------------------------------------------
 
 class FabricTestSoC(SoCMini):
-    def __init__(self, **kwargs):
+    def __init__(self, nodes=2, **kwargs):
         platform     = Platform()
         sys_clk_freq = int(1e6)
 
@@ -360,7 +521,10 @@ class FabricTestSoC(SoCMini):
         self.crg = CRG(platform.request("sys_clk"))
 
         # Bench ------------------------------------------------------------------------------------
-        self.bench = bench = FabricTestBench(clk_freq=sys_clk_freq, **kwargs)
+        if nodes == 2:
+            self.bench = bench = FabricTestBench(clk_freq=sys_clk_freq, **kwargs)
+        else:
+            self.bench = bench = FabricNetworkBench(nodes=nodes, **kwargs)
         requests = sum(1 for steps in bench.steps.values() for s in steps if s[0] in [WRITE, READ])
         self.sync += [
             If(bench.done,
@@ -382,27 +546,42 @@ class FabricTestSoC(SoCMini):
 
 def main():
     parser = argparse.ArgumentParser(description="Fabric LiteX/Verilator simulation.")
-    parser.add_argument("--scenarios",         default=",".join(SCENARIOS), help="Scenarios to run (comma separated).")
+    parser.add_argument("--nodes",             default=2, type=int,         help="Nodes (2: SerWB link, more: network with word-level links).")
+    parser.add_argument("--topology",          default="two_tier",          help="Network: topology (two_tier or hypercube).")
+    parser.add_argument("--down",              default=None, type=int,      help="Network: node cut by the down scenario.")
+    parser.add_argument("--queue-depth",       default=2, type=int,         help="Network: packets per class in the ports.")
+    parser.add_argument("--scenarios",         default=None,                help="Scenarios to run (comma separated).")
     parser.add_argument("--sram-latency",      default=0, type=int,         help="SRAM ack latency (cycles).")
-    parser.add_argument("--with-flow-control", action="store_true",         help="Enable PHY flow control.")
+    parser.add_argument("--with-flow-control", action="store_true",         help="Two nodes: enable PHY flow control.")
     parser.add_argument("--output-dir",        default=None,                help="Build directory.")
     parser.add_argument("--trace",             action="store_true",         help="Enable tracing.")
     parser.add_argument("--trace-fst",         action="store_true",         help="Use .fst format for tracing.")
     args = parser.parse_args()
 
-    scenarios = args.scenarios.split(",")
+    available = SCENARIOS if args.nodes == 2 else NETWORK_SCENARIOS
+    scenarios = available if args.scenarios is None else args.scenarios.split(",")
     for scenario in scenarios:
-        if scenario not in SCENARIOS:
-            raise ValueError(f"Unknown scenario {scenario} (available: {SCENARIOS}).")
+        if scenario not in available:
+            raise ValueError(f"Unknown scenario {scenario} (available: {available}).")
 
     sim_config = SimConfig()
     sim_config.add_clocker("sys_clk", freq_hz=1e6)
 
-    soc = FabricTestSoC(
-        scenarios         = scenarios,
-        sram_latency      = args.sram_latency,
-        with_flow_control = args.with_flow_control,
-    )
+    if args.nodes == 2:
+        soc = FabricTestSoC(
+            scenarios         = scenarios,
+            sram_latency      = args.sram_latency,
+            with_flow_control = args.with_flow_control,
+        )
+    else:
+        soc = FabricTestSoC(
+            nodes        = args.nodes,
+            topology     = args.topology,
+            scenarios    = scenarios,
+            down         = args.down,
+            sram_latency = args.sram_latency,
+            queue_depth  = args.queue_depth,
+        )
     builder = Builder(soc, output_dir=args.output_dir, csr_csv=None)
     builder.build(sim_config=sim_config,
         trace     = args.trace,

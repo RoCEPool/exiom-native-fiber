@@ -54,7 +54,7 @@ class TestFabricBench(unittest.TestCase):
             results["max_pending"] = max_pending
             results["results"]     = {"a": (yield dut.a_seq.results), "b": (yield dut.b_seq.results)}
             results["stale"]       = (yield dut.nodes["a"].requester.stale) + (yield dut.nodes["b"].requester.stale)
-            results["rx_drops"]    = (yield dut.nodes["a"].responder.rx_drops) + (yield dut.nodes["b"].responder.rx_drops)
+            results["rx_drops"]    = (yield dut.nodes["a"].ports[0].rx_drops) + (yield dut.nodes["b"].ports[0].rx_drops)
             for name in ["a", "b"]:
                 results[name] = []
                 for i in range(64):
@@ -125,6 +125,60 @@ class TestFabricBench(unittest.TestCase):
                 self.assertEqual(results["done"], 1)
                 self.assertEqual(results["errors"], 1)
                 self.assertEqual(results["failed"], (sim.NODE_A, 1))
+
+class TestFabricNetworkBench(unittest.TestCase):
+    """Network bench (word-level links, one sequencer per node). 4 nodes here; 8 and 16 nodes with
+    Verilator (test/test_fabric_sim.py)."""
+    def run_bench(self, **kwargs):
+        sim     = load_sim()
+        dut     = sim.FabricNetworkBench(timeout=400000, **kwargs)
+        results = {}
+        def generator():
+            was_down = 0
+            while not ((yield dut.done) or (yield dut.timeout)):
+                was_down |= (yield dut.node_down)
+                yield
+            results["done"]      = (yield dut.done)
+            results["errors"]    = (yield dut.errors)
+            results["failed"]    = ((yield dut.failed_node), (yield dut.failed_step))
+            results["was_down"]  = was_down
+            results["results"]   = []
+            results["forwarded"] = 0
+            results["drops"]     = 0
+            for n, node in enumerate(dut.net.nodes):
+                results["results"].append((yield dut.seqs[n].results))
+                results["forwarded"] += (yield node.forwarded)
+                results["drops"]     += (yield node.requester.stale)
+                for port in node.ports:
+                    results["drops"] += (yield port.rx_drops) + (yield port.resyncs)
+        run_simulation(dut, generator())
+        self.assertEqual(results["done"], 1)
+        node, step = results["failed"]
+        self.assertEqual(results["errors"], 0, "first failed step: node {} {}".format(node, dut.steps[node][step]))
+        # Every request got exactly one result, nothing dropped.
+        for n in range(len(dut.net.nodes)):
+            requests = sum(1 for s in dut.steps[n] if s[0] in [sim.WRITE, sim.READ])
+            self.assertEqual(results["results"][n], requests)
+        self.assertEqual(results["drops"], 0)
+        return sim, dut, results
+
+    def test_4_nodes(self):
+        sim, dut, results = self.run_bench(nodes=4)
+        self.assertEqual(results["was_down"], 1)
+        # Statuses expected with the node cut: served, link down (to the node), and from the node.
+        statuses = set(s[4] for n in range(4) for s in dut.steps[n] if s[0] == sim.WRITE)
+        self.assertTrue({FABRIC_OK, FABRIC_LINK, FABRIC_RANGE, FABRIC_NODE} <= statuses)
+
+    def test_4_nodes_small_buffers(self):
+        self.run_bench(nodes=4, sram_latency=20, queue_depth=1, buffer_depth=2)
+
+    def test_4_nodes_hypercube(self):
+        # Requests forwarded by a node (2 links), and responses lost on their way back through
+        # the node cut.
+        sim, dut, results = self.run_bench(nodes=4, topology="hypercube")
+        self.assertGreater(results["forwarded"], 0)
+        statuses = set(s[4] for n in range(4) for s in dut.steps[n] if s[0] == sim.WRITE)
+        self.assertIn(FABRIC_NO_RESPONSE, statuses)
 
 if __name__ == "__main__":
     unittest.main()

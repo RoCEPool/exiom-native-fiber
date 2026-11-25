@@ -7,8 +7,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Fabric end-to-end Verilator simulations (two symmetric nodes, one SerWB link, requests in flight;
-normal accesses in both directions, errors in flight with valid requests, link cut and recovery).
+Fabric end-to-end Verilator simulations:
+
+- Two symmetric nodes, one bit-level SerWB link: requests in flight in both directions, errors in
+  flight with valid requests, link cut and recovery.
+- Networks of 4, 8 and 16 nodes (word-level links): all nodes to all nodes over up to 3 links,
+  hotspot, errors, one node cut from the fabric and back.
 
 Uses the self-checking FabricTestSoC of bench/fabric/sim.py. Skipped when Verilator is not installed.
 """
@@ -23,9 +27,17 @@ import subprocess
 SIM = os.path.join(os.path.dirname(__file__), "..", "bench", "fabric", "sim.py")
 
 CONFIGS = {
-    "default"      : [],
-    "slow"         : ["--sram-latency", "64"],
-    "flow_control" : ["--with-flow-control", "--sram-latency", "16"],
+    # Two nodes, bit-level SerWB link.
+    "default"              : [],
+    "slow"                 : ["--sram-latency", "64"],
+    "flow_control"         : ["--with-flow-control", "--sram-latency", "16"],
+    # Networks, word-level links (two-tier topology cabled for 16 nodes).
+    "4_nodes"              : ["--nodes", "4"],
+    "4_nodes_small_buffers": ["--nodes", "4", "--queue-depth", "1", "--sram-latency", "20"],
+    "8_nodes"              : ["--nodes", "8", "--sram-latency", "8"],
+    "8_nodes_hypercube"    : ["--nodes", "8", "--topology", "hypercube"],
+    "16_nodes"             : ["--nodes", "16"],
+    "16_nodes_small_buffers": ["--nodes", "16", "--queue-depth", "1", "--sram-latency", "20"],
 }
 
 @unittest.skipUnless(shutil.which("verilator"), "Verilator not installed.")
@@ -37,7 +49,7 @@ class TestFabricSim(unittest.TestCase):
                 stdout         = subprocess.PIPE,
                 stderr         = subprocess.STDOUT,
                 text           = True,
-                timeout        = 600,
+                timeout        = 3000,
             )
         results = [l for l in p.stdout.splitlines() if "FABRIC TEST" in l]
         return results[0] if results else p.stdout[-2000:]
