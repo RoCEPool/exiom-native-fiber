@@ -106,6 +106,22 @@ Paths left with one node down (`test_one_node_down`):
 
 Cost: `2 * max_hops` queues per port (10 with a hop limit of 5), `queue_depth` packets each.
 
+## Throughput
+
+The switch moves one packet per cycle (the next input that has a packet, in turn), ports send
+packets back to back, and flow control packets are sent at once when the neighbor has no credit
+left. Requests per 1000 cycles, writes sent as fast as the nodes accept them, word-level links
+(`test_throughput` keeps floors about 25 % below):
+
+| Fabric | Before | After |
+|--------|--------|-------|
+| 2 nodes, one way | 38 | 141 |
+| 2 nodes, both ways | 38 | 164 |
+| 4 nodes, 3 nodes to one | 38 | 187 |
+| 4 nodes, all to all | 112 | 516 |
+| 8 nodes (one cable between the groups), all to all | 81 | 256 |
+| 16 nodes, all to all | 239 | 883 |
+
 ## Semantics
 
 - Every request gets exactly one result, identified by its tag. A failed request only fails
@@ -153,7 +169,8 @@ have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
   requests can fail (see above).
 - At most 6 links on a path (12 classes per port, one flow control packet). Distances are 3-bit.
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
-- The switch looks at one input per cycle: sized for correctness, not for throughput.
+- Throughput is bounded by the links, not by the switch: a link carries one 32-bit word per
+  cycle, and a write and its response are 6 words.
 
 ## Verification
 
