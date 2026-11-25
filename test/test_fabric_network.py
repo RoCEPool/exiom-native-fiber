@@ -173,6 +173,55 @@ def hotspot(test, dut, dst=0, writes=6):
     test.assertEqual((yield dut.nodes[dst].responder.requests) - before, 2*writes*(n - 1))
     yield from dut.check_no_drop(test)
 
+def flood(test, dut, sources, destination, requests, floor):
+    """Writes sent as fast as the nodes accept them: `floor` requests per 1000 cycles at least."""
+    cycles = [0]
+    def node_generator(src):
+        node   = dut.nodes[src]
+        prng   = random.Random(src)
+        sink   = node.requester.sink
+        source = node.requester.source
+        sent, received = 0, 0
+        yield source.ready.eq(1)
+        yield sink.we.eq(1)
+        yield sink.sel.eq(0b1111)
+        while received < requests:
+            yield sink.valid.eq(int(sent < requests))
+            if sent < requests:
+                yield sink.dst.eq(destination(src, prng))
+                yield sink.adr.eq(sent % 32)
+                yield sink.dat_w.eq(sent)
+            yield
+            if (sent < requests) and (yield sink.ready):
+                sent += 1
+            if (yield source.valid):
+                test.assertEqual((yield source.status), FABRIC_OK)
+                received += 1
+        yield sink.valid.eq(0)
+        yield source.ready.eq(0)
+    running = [node_generator(src) for src in sources]
+    # One generator per source and the cycle counter, together.
+    def together():
+        generators = [g for g in running]
+        while generators:
+            still = []
+            for g in generators:
+                try:
+                    command = next(g)
+                    while command is not None:
+                        command = g.send((yield command))
+                    still.append(g)
+                except StopIteration:
+                    pass
+            generators = still
+            if generators:
+                cycles[0] += 1
+                yield
+    yield from together()
+    rate = 1000*requests*len(sources)/cycles[0]
+    test.assertGreater(rate, floor, f"{rate:.0f} requests per 1000 cycles")
+    yield from dut.check_no_drop(test)
+
 SETTLE = 800 # Cycles for the routes to follow a change (route packets every 64 cycles here).
 
 def degraded(test, dut, down, check=None):
@@ -245,6 +294,19 @@ class TestFabricNetwork(unittest.TestCase):
             node_down(self, dut, down=2),
             link_down(self, dut, link=(0, 0)), # Nodes 0 and 1 then talk through another node.
             all_to_all(self, dut, salt=1, check_hops=False),
+        ])
+
+    def test_throughput(self):
+        # Requests per 1000 cycles, word-level links (floors about 25 % under the rates measured).
+        dut = DUT(two_tier(2))
+        run(dut, [
+            flood(self, dut, [0],    lambda src, prng: 1,       200, floor=105),
+            flood(self, dut, [0, 1], lambda src, prng: 1 - src, 200, floor=120),
+        ])
+        dut = DUT(two_tier(4))
+        run(dut, [
+            flood(self, dut, [1, 2, 3],    lambda src, prng: 0, 100, floor=140), # One destination.
+            flood(self, dut, [0, 1, 2, 3], lambda src, prng: (src + 1 + prng.randrange(3)) % 4, 100, floor=380),
         ])
 
     def test_4_nodes_backpressure(self):
