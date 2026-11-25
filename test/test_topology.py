@@ -64,6 +64,41 @@ class TestTopology(unittest.TestCase):
             else:
                 self.assertIsNotNone(h)
 
+    def test_one_node_down(self):
+        # Paths left when any one node is down, and their length (links).
+        from exiom.network import expected_status
+        from exiom.fabric  import FABRIC_OK
+        for name, t, longest, all_served in [
+            ("4 nodes",              two_tier(4),                   1, True),
+            ("8 nodes, 16 design",   two_tier(8),                   3, False), # One cable between the groups.
+            ("8 nodes, 8 design",    two_tier(8, design_groups=2),  2, True),
+            ("16 nodes",             two_tier(16),                  5, True),
+            ("32 nodes",             two_tier(32, design_groups=8, inter_ports=2), 4, True),
+        ]:
+            with self.subTest(fabric=name):
+                served, worst = True, 0
+                for down in range(t.nodes):
+                    distances = t.distances(down=[down])
+                    for src in range(t.nodes):
+                        for dst in range(t.nodes):
+                            if down in (src, dst) or src == dst:
+                                continue
+                            d = distances[src].get(dst)
+                            served &= d is not None
+                            worst   = max(worst, d or 0)
+                            status  = expected_status(t, 6, src, dst, down=[down])
+                            self.assertEqual(status == FABRIC_OK, d is not None)
+                self.assertEqual((served, worst), (all_served, longest))
+
+    def test_costs(self):
+        # Cost of a port: links to the destination through it, without coming back.
+        t = two_tier(4)
+        self.assertEqual(t.costs()[0][1], [1, 2, 2, None]) # Direct, or through nodes 2 or 3.
+        t = two_tier(8)
+        costs = t.costs()
+        self.assertEqual(costs[0][6], [None, None, None, 1]) # Node 0 has the only cable to node 6.
+        self.assertEqual(costs[1][6], [3, 3, 2, None])       # Node 1: through node 0, directly or not.
+
     def test_hypercube(self):
         for nodes, hops in [(2, 1), (4, 2), (8, 3), (16, 4)]:
             t = hypercube(nodes)

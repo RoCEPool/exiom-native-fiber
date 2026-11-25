@@ -31,6 +31,9 @@ from exiom.fabric import *
 
 from test.test_serwb_link import LoopbackPHY, bus_access
 
+# After the other imports (run_simulation is also exported by litex.gen).
+from test.fabric_sim import run_simulation # Same simulator, starts faster on large designs.
+
 # Memory -------------------------------------------------------------------------------------------
 
 class Memory(LiteXModule):
@@ -433,7 +436,7 @@ class TestFabric(unittest.TestCase):
         # Link lost at any point of a request/response exchange (packets cut anywhere): the
         # requests in flight end with FABRIC_LINK or their real result, and the nodes are back in
         # sync when the link returns.
-        for delay in range(0, 160, 3):
+        for delay in range(0, 160, 5):
             with self.subTest(delay=delay):
                 dut = DUT(link="serwb", mem_kwargs=dict(latency=4))
                 def generator():

@@ -102,6 +102,48 @@ class Topology:
         hops = [h for h in self.hops(routes).values() if h is not None]
         return max(hops) if hops else 1
 
+    def distances(self, down=()):
+        """{node: {destination: links of the shortest path}}. ``down``: nodes, or links ((node,
+        port) of one of their ends), that are down."""
+        down_ports = set()
+        down_nodes = set()
+        for d in down:
+            if isinstance(d, tuple):
+                down_ports |= {d, self.peers[d]}
+            else:
+                down_nodes.add(d)
+        distances = {}
+        for src in range(self.nodes):
+            distances[src] = {src: 0}
+            if src in down_nodes:
+                continue
+            queue = deque([src])
+            while queue:
+                node = queue.popleft()
+                for port, neighbor in self.neighbors(node):
+                    if ((node, port) in down_ports) or (neighbor in down_nodes) or (neighbor in distances[src]):
+                        continue
+                    distances[src][neighbor] = distances[src][node] + 1
+                    queue.append(neighbor)
+        return distances
+
+    def costs(self):
+        """Route tables: {node: {destination: [cost per port]}}, the cost of a port being the links
+        to the destination through it, without coming back through the node, with all the links up
+        (None: no cable or destination not reachable through it)."""
+        costs = {}
+        for node in range(self.nodes):
+            distances   = self.distances(down=[node])
+            costs[node] = {}
+            for dst in range(self.nodes):
+                if dst == node:
+                    continue
+                costs[node][dst] = [None]*self.ports
+                for port, neighbor in self.neighbors(node):
+                    if dst in distances[neighbor]:
+                        costs[node][dst][port] = 1 + distances[neighbor][dst]
+        return costs
+
 # Two-Tier -----------------------------------------------------------------------------------------
 
 def two_tier(nodes, group_size=4, design_groups=4, inter_ports=1):
