@@ -175,7 +175,8 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
   with the bit-level generic PHYs, and 4-node networks with one hardware sequencer per node.
 - `test_fabric_sim.py`: the same benches with Verilator (runs in CI): two nodes bit-level, and
-  networks of 4, 8 and 16 nodes.
+  networks of 4 and 8 nodes. The Verilator build of 16 nodes needs more memory than the CI runner
+  has since the routes were added; 16 nodes run with the Migen simulator.
 
 `test/fabric_sim.py` runs the Migen simulator with a faster equivalent of its statement grouping
 (the original takes minutes to start on 8 nodes and more).

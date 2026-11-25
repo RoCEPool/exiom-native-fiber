@@ -11,7 +11,7 @@ Fabric end-to-end Verilator simulations:
 
 - Two symmetric nodes, one bit-level SerWB link: requests in flight in both directions, errors in
   flight with valid requests, link cut and recovery.
-- Networks of 4, 8 and 16 nodes (word-level links): all nodes to all nodes over up to 3 links,
+- Networks of 4 and 8 nodes (word-level links): all nodes to all nodes over up to 3 links,
   hotspot, errors, one node cut from the fabric and back.
 
 Uses the self-checking FabricTestSoC of bench/fabric/sim.py. Skipped when Verilator is not installed.
@@ -36,8 +36,8 @@ CONFIGS = {
     "4_nodes_small_buffers": ["--nodes", "4", "--queue-depth", "1", "--sram-latency", "20"],
     "8_nodes"              : ["--nodes", "8", "--sram-latency", "8"],
     "8_nodes_hypercube"    : ["--nodes", "8", "--topology", "hypercube"],
-    "16_nodes"             : ["--nodes", "16"],
-    "16_nodes_small_buffers": ["--nodes", "16", "--queue-depth", "1", "--sram-latency", "20"],
+    # 16 nodes: with the Migen simulator (test_fabric_network.py); their Verilator build needs more
+    # memory than the CI runner has (./bench/fabric/sim.py --nodes 16 on a larger machine).
 }
 
 @unittest.skipUnless(shutil.which("verilator"), "Verilator not installed.")
