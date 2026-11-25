@@ -9,6 +9,9 @@ SoC bus -> RMAInitiator -> SERWBCore("slave") -> link -> SERWBCore("master") -> 
 
 Code: `exiom/rma.py`. Simulation: `bench/rma/sim.py`. Tests: `test/test_rma*.py`.
 
+One requester, one target, one access at a time. For several requests in flight and for more than
+two nodes, see [FABRIC.md](FABRIC.md).
+
 ## Why a layer above SerWB
 
 SerWB already carries Wishbone reads and writes, reports remote errors on reads and returns an
