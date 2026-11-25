@@ -1,0 +1,340 @@
+#
+# This file is part of LiteICLink.
+#
+# Copyright (c) 2017-2024 Florent Kermarrec <florent@enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
+from migen import *
+
+from litex.gen import *
+from litex.gen.genlib.misc import WaitTimer
+
+from litex.soc.interconnect import stream
+
+# Constants ----------------------------------------------------------------------------------------
+
+PREAMBLE = 0x5aa55aa5
+
+# Layouts ------------------------------------------------------------------------------------------
+
+def packet_description(dw):
+    # error: set on the last word of a packet cut by the depacketizer timeout (the word is not
+    # packet data, the packet has to be discarded).
+    payload_layout = [("data", dw)]
+    param_layout   = [("port", 8), ("length", 16), ("error", 1)]
+    return stream.EndpointDescription(payload_layout, param_layout)
+
+def phy_description(dw):
+    layout = [("data", dw)]
+    return stream.EndpointDescription(layout)
+
+# CRC ----------------------------------------------------------------------------------------------
+
+class _CRC16(LiteXModule):
+    """CRC-16 (CCITT) over 32-bit words (reset to 0xffff on `reset`, updated on `update`).
+
+    SerWB packets are short (a few words): CRC-16 detects all 1/2/3-bit errors and bursts up to
+    16-bit on them, at about half the logic of a CRC-32.
+    """
+    polynom = 0x1021
+
+    def __init__(self):
+        self.reset  = Signal()
+        self.update = Signal()
+        self.data   = Signal(32)
+        self.value  = Signal(16, reset=2**16-1)
+
+        # # #
+
+        # Next CRC value: LFSR (data LSB first) unrolled over the 32 data bits, each CRC bit is the
+        # XOR of previous CRC bits and data bits.
+        crc_next  = Signal(16)
+        equations = self.lfsr_equations(data_width=32, width=16, polynom=self.polynom)
+        for i, (state_bits, data_bits) in enumerate(equations):
+            xors = [self.value[n] for n in state_bits] + [self.data[n] for n in data_bits]
+            self.comb += crc_next[i].eq(Reduce("XOR", xors))
+        self.sync += [
+            If(self.reset,
+                self.value.eq(2**16-1)
+            ).Elif(self.update,
+                self.value.eq(crc_next)
+            )
+        ]
+
+    @staticmethod
+    def lfsr_equations(data_width, width, polynom):
+        """Return, for each CRC bit, the (previous CRC bits, data bits) XORed to compute it."""
+        # Each bit is tracked as a set of terms: a term XORed twice cancels out.
+        bits = [{("state", i)} for i in range(width)]
+        for n in range(data_width):
+            feedback = bits.pop(-1) ^ {("data", n)}
+            for pos in range(width - 1):
+                if (polynom >> (pos + 1)) & 1:
+                    bits[pos] = bits[pos] ^ feedback
+            bits.insert(0, feedback)
+        return [(
+            sorted(n for t, n in terms if t == "state"),
+            sorted(n for t, n in terms if t == "data"),
+        ) for terms in bits]
+
+# Packetizer ---------------------------------------------------------------------------------------
+
+class Packetizer(LiteXModule):
+    def __init__(self, with_crc=False):
+        self.sink   = sink   = stream.Endpoint(packet_description(32))
+        self.source = source = stream.Endpoint(phy_description(32))
+
+        # # #
+
+        # Packet description.
+        # - Preamble : 4 bytes.
+        # - Port     : 1 byte.
+        # - Length   : 2 bytes.
+        # - Payload  : length bytes.
+        # - CRC16    : 4 bytes (optional, zero-extended, over Port/Length and Payload).
+
+        # CRC.
+        # ----
+        if with_crc:
+            self.crc = crc = _CRC16()
+            self.comb += [
+                crc.data.eq(source.data),
+                crc.update.eq(source.valid & source.ready),
+            ]
+
+        # FSM.
+        # ----
+        self.fsm = fsm = FSM(reset_state="PREAMBLE")
+        fsm.act("PREAMBLE",
+            If(sink.valid,
+                source.valid.eq(1),
+                source.data.eq(PREAMBLE),
+                If(source.ready,
+                    NextState("PORT-LENGTH")
+                )
+            )
+        )
+        if with_crc:
+            fsm.act("PREAMBLE", crc.reset.eq(1))
+        fsm.act("PORT-LENGTH",
+            source.valid.eq(1),
+            source.data[0 :8].eq(sink.port),
+            source.data[8:24].eq(sink.length),
+            If(source.ready,
+                NextState("DATA")
+            )
+        )
+        fsm.act("DATA",
+            source.valid.eq(sink.valid),
+            source.data.eq(sink.data),
+            sink.ready.eq(source.ready),
+            If(sink.valid & source.ready & sink.last,
+                NextState("CRC" if with_crc else "PREAMBLE")
+            )
+        )
+        if with_crc:
+            fsm.act("CRC",
+                source.valid.eq(1),
+                source.data.eq(crc.value),
+                crc.update.eq(0),
+                If(source.ready,
+                    NextState("PREAMBLE")
+                )
+            )
+
+# Depacketizer -------------------------------------------------------------------------------------
+
+class Depacketizer(LiteXModule):
+    def __init__(self, clk_freq, timeout=1e-3):
+        self.sink   = sink   = stream.Endpoint(phy_description(32))
+        self.source = source = stream.Endpoint(packet_description(32))
+
+        # # #
+
+        # Packet description.
+        # - Preamble : 4 bytes.
+        # - Port     : 1 byte.
+        # - Length   : 2 bytes.
+        # - Payload
+
+        # Signals.
+        # --------
+        port   = Signal(len(source.port))
+        count  = Signal(len(source.length))
+        length = Signal(len(source.length))
+
+        # Timer.
+        # ------
+        # Drop incomplete packets after timeout (in seconds) without incoming data (the timer does not
+        # run while the packet is only stalled by downstream).
+        self.timer = timer = WaitTimer(int(clk_freq*timeout))
+
+        # FSM.
+        # ----
+        self.fsm = fsm = FSM(reset_state="PREAMBLE")
+        fsm.act("PREAMBLE",
+            sink.ready.eq(1),
+            If(sink.valid &
+              (sink.data == PREAMBLE),
+                NextState("PORT-LENGTH")
+            )
+        )
+        fsm.act("PORT-LENGTH",
+            sink.ready.eq(1),
+            If(sink.valid,
+                NextValue(count, 0),
+                NextValue(port,   sink.data[0:8]),
+                NextValue(length, sink.data[8:24]),
+                # Packets without payload words are dropped.
+                If(sink.data[8+2:24] != 0,
+                    NextState("DATA")
+                ).Else(
+                    NextState("PREAMBLE")
+                )
+            ),
+            timer.wait.eq(~sink.valid)
+        )
+        fsm.act("DATA",
+            source.valid.eq(sink.valid),
+            source.last.eq(count == (length[2:] - 1)),
+            source.port.eq(port),
+            source.length.eq(length),
+            source.data.eq(sink.data),
+            sink.ready.eq(source.ready),
+            # Timeout: end the packet with an error word (last + error) so that the consumers
+            # resynchronize instead of taking the next packet as its continuation.
+            If(timer.done,
+                source.valid.eq(1),
+                source.last.eq(1),
+                source.error.eq(1),
+            ),
+            If(source.valid & source.ready,
+                NextValue(count, count + 1),
+                If(source.last,
+                    NextState("PREAMBLE")
+                )
+            ),
+            timer.wait.eq(~sink.valid)
+        )
+
+# CRC Depacketizer ---------------------------------------------------------------------------------
+
+class CRCDepacketizer(LiteXModule):
+    """Depacketizer for packets with CRC16 (see Packetizer(with_crc=True)).
+
+    Packets are stored (with backpressure, so compatible with link flow control), checked and only
+    forwarded when the CRC is valid. Packets with invalid CRC, payload larger than `max_words` or
+    timing out are dropped (`crc_error`/`drop` pulse per dropped packet).
+    """
+    def __init__(self, clk_freq, timeout=1e-3, max_words=64):
+        self.sink      = sink   = stream.Endpoint(phy_description(32))
+        self.source    = source = stream.Endpoint(packet_description(32))
+        self.crc_error = Signal()
+        self.drop      = Signal()
+
+        # # #
+
+        # Signals.
+        # --------
+        port   = Signal(len(source.port))
+        length = Signal(len(source.length))
+        words  = Signal(len(source.length) - 2)
+        count  = Signal(len(source.length) - 2)
+
+        # Payload Buffer.
+        # ---------------
+        self.fifo = fifo = stream.SyncFIFO([("data", 32)], max_words)
+
+        # CRC.
+        # ----
+        self.crc = crc = _CRC16()
+        self.comb += crc.data.eq(sink.data)
+
+        # Timer.
+        # ------
+        # Drop incomplete packets after timeout (in seconds) without incoming data.
+        self.timer = timer = WaitTimer(int(clk_freq*timeout))
+
+        # FSM.
+        # ----
+        self.fsm = fsm = FSM(reset_state="PREAMBLE")
+        fsm.act("PREAMBLE",
+            sink.ready.eq(1),
+            crc.reset.eq(1),
+            If(sink.valid &
+              (sink.data == PREAMBLE),
+                NextState("PORT-LENGTH")
+            )
+        )
+        fsm.act("PORT-LENGTH",
+            sink.ready.eq(1),
+            If(sink.valid,
+                crc.update.eq(1),
+                NextValue(count,  0),
+                NextValue(port,   sink.data[0:8]),
+                NextValue(length, sink.data[8:24]),
+                NextValue(words,  sink.data[8+2:24]),
+                # Packets without payload words or too large to be stored are dropped.
+                If((sink.data[8+2:24] != 0) & (sink.data[8+2:24] <= max_words),
+                    NextState("STORE")
+                ).Else(
+                    self.drop.eq(1),
+                    NextState("PREAMBLE")
+                )
+            ),
+            timer.wait.eq(~sink.valid)
+        )
+        fsm.act("STORE",
+            fifo.sink.valid.eq(sink.valid),
+            fifo.sink.data.eq(sink.data),
+            sink.ready.eq(fifo.sink.ready),
+            If(timer.done,
+                NextValue(count, 0),
+                self.drop.eq(1),
+                NextState("FLUSH")
+            ).Elif(sink.valid & sink.ready,
+                crc.update.eq(1),
+                NextValue(count, count + 1),
+                If(count == (words - 1),
+                    NextState("CHECK")
+                )
+            ),
+            timer.wait.eq(~sink.valid)
+        )
+        fsm.act("CHECK",
+            sink.ready.eq(1),
+            NextValue(count, 0),
+            If(timer.done,
+                self.drop.eq(1),
+                NextState("FLUSH")
+            ).Elif(sink.valid,
+                If(sink.data == crc.value,
+                    NextState("FORWARD")
+                ).Else(
+                    self.crc_error.eq(1),
+                    self.drop.eq(1),
+                    NextState("FLUSH")
+                )
+            ),
+            timer.wait.eq(~sink.valid)
+        )
+        fsm.act("FORWARD",
+            source.valid.eq(fifo.source.valid),
+            source.last.eq(count == (words - 1)),
+            source.port.eq(port),
+            source.length.eq(length),
+            source.data.eq(fifo.source.data),
+            fifo.source.ready.eq(source.ready),
+            If(source.valid & source.ready,
+                NextValue(count, count + 1),
+                If(source.last,
+                    NextState("PREAMBLE")
+                )
+            )
+        )
+        fsm.act("FLUSH",
+            fifo.source.ready.eq(1),
+            If(~fifo.source.valid & (fifo.level == 0),
+                NextState("PREAMBLE")
+            )
+        )
