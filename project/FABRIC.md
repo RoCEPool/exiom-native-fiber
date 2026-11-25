@@ -41,7 +41,31 @@ nodes present: growing 2 -> 4 -> 8 -> 16 only adds cables (`test_two_tier_growth
 With 8 nodes of a fabric cabled for 16, the two groups are connected by one cable.
 
 `exiom/topology.py` builds the topology (`two_tier()`, and `hypercube()` to check that nothing
-depends on the topology) and the static route tables (shortest paths).
+depends on the topology) and the route tables at reset.
+
+## Routes: following the state of the fabric
+
+- Each node keeps, per destination, the cost of each of its ports: the links to the destination
+  through this port. A packet leaves by the port with the lowest cost among those that are up,
+  are not the port it came from, and can reach the destination within the hop limit.
+- Each node regularly sends to each neighbor its distance to every destination without going
+  through this neighbor (route packets, also sent when a distance changes or a link comes up).
+  The cost of a port is the distance received on it plus one; a link that goes down makes its
+  port unusable until its neighbor sends its distances again.
+- When a link or a node goes down, the change spreads from neighbor to neighbor and packets take
+  the shortest path that is left. Requests for a node that cannot be reached any more are
+  answered at once with `FABRIC_NODE`, without being sent.
+- Hop limit: longest shortest path of the fabric plus 2 links of detour (6 at most).
+
+Paths left with one node down (`test_one_node_down`):
+
+| Fabric | Other nodes still reach each other | Longest path |
+|--------|------------------------------------|--------------|
+| 4 nodes | Yes | 1 link |
+| 8 nodes, cabled for 16 | Not when it is one of the two nodes with the cable between the groups | 3 links |
+| 8 nodes, cabled for 8 (4 cables between the groups) | Yes | 2 links |
+| 16 nodes | Yes | 5 links |
+| 32 nodes | Yes | 4 links |
 
 ## Packet
 
@@ -55,8 +79,9 @@ depends on the topology) and the static route tables (shortest paths).
 | 3 | Write data (write request) |
 
 - Word 0 is all a node needs to forward a packet. Up to 256 nodes.
-- Hop limit: number of links of the longest route at the source, decremented by each forwarding
-  node.
+- Hop limit: links the packet may cross, decremented by each forwarding node.
+- Bit `[26]` of word 0 marks a route packet (word 1: first destination, words 2 and 3: 10
+  distances of 3 bits each); like flow control packets, it only goes to the neighbor.
 - Tag: slot of the request in the Requester and generation of this slot. A response arriving
   after its request timed out does not match the request that reuses the slot and is dropped.
 
@@ -79,15 +104,15 @@ depends on the topology) and the static route tables (shortest paths).
 - Link down: the queues and the credits of the port are reset, packets for this port are
   discarded instead of stalling the node.
 
-Cost: `2 * max_hops` queues per port (6 with 3 links at most), `queue_depth` packets each.
+Cost: `2 * max_hops` queues per port (10 with a hop limit of 5), `queue_depth` packets each.
 
 ## Semantics
 
 - Every request gets exactly one result, identified by its tag. A failed request only fails
   itself.
 - Writes are acknowledged by the node that executed them.
-- Requests from one node to another are executed in the order they were accepted; results are
-  returned as they complete.
+- Requests from one node to another are executed in the order they were accepted, as long as
+  the links of their route do not change state; results are returned as they complete.
 - Up to `requests` requests in flight per node (8 by default); the Requester applies
   backpressure beyond that.
 
@@ -98,18 +123,19 @@ Cost: `2 * max_hops` queues per port (6 with 3 links at most), `queue_depth` pac
 | `FABRIC_RO` | Destination | Write to a read-only window, not executed |
 | `FABRIC_BUS` | Destination | Memory bus error |
 | `FABRIC_TIMEOUT` | Destination | Memory did not answer |
-| `FABRIC_NODE` | Requester or node on the way | No route to the destination, or the next link of the route is down: not executed |
-| `FABRIC_LINK` | Requester | First link of the route down: not confirmed, may have been executed |
+| `FABRIC_NODE` | Requester or node on the way | Destination not reachable (unknown, or no path within the hop limit): not executed |
+| `FABRIC_LINK` | Requester | No link up on this node: not confirmed, may have been executed |
 | `FABRIC_NO_RESPONSE` | Requester | No response within the timeout: not confirmed, may have been executed |
 
-Node or link down: routes are static, there is no rerouting. Requests to the node, or whose
-route crosses it, end with `FABRIC_LINK` (seen by the Requester) or `FABRIC_NODE` (seen by a node
-on the way); a request whose response route crosses it ends with `FABRIC_NO_RESPONSE`; all the
-other requests are served.
+Node or link down, once the routes have followed (a few route packet periods): requests to a node
+that cannot be reached are answered with `FABRIC_NODE`, all the others are served by the paths
+that are left. Requests in flight through the link when it goes down, or sent before the routes
+have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
 
 ## Interfaces
 
-- `FabricNode(node_id, size, ports, routes, max_hops, ...)`: one node. `requester.sink`
+- `FabricNode(node_id, size, ports, routes, max_hops, ...)`: one node (`routes`: costs at reset,
+  from `Topology.costs()`). `requester.sink`
   (requests: `we`, `dst`, `adr`, `dat_w`, `sel`; `requester.tag` gives the tag of the request
   being accepted), `requester.source` (results: `tag`, `we`, `status`, `dat_r`), `responder.mem`
   (memory window).
@@ -123,8 +149,9 @@ other requests are served.
 ## Limits
 
 - No retransmission: errors are reported, the user decides.
-- Static routes: no rerouting around a link or node that is down.
-- At most 3 links between two nodes (6 classes per port, one flow control packet).
+- A node only learns the state of the fabric from its neighbors: while a change spreads,
+  requests can fail (see above).
+- At most 6 links on a path (12 classes per port, one flow control packet). Distances are 3-bit.
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
 - The switch looks at one input per cycle: sized for correctness, not for throughput.
 
@@ -135,17 +162,23 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
     test/test_fabric_bench.py test/test_fabric_sim.py
 ```
 
-- `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, routes, node down.
+- `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
+  with any one node down.
 - `test_fabric.py`: two nodes, connected directly and through SerWB (word-level PHY model):
   requests in flight, queueing, both directions, errors isolated to their request, lost request,
   lost response, late response, link down (with a sweep of the moment the link is lost),
   backpressure with the smallest buffers, credit recovery, invalid packets, Wishbone.
-- `test_fabric_network.py`: 4 nodes (two-tier and hypercube) and 8 nodes: all nodes to all nodes,
-  random traffic checked against a model, hotspot, node cut and back, smallest buffers.
+- `test_fabric_network.py`: 4 nodes (two-tier and hypercube), 8 nodes (cabled for 16 and for 8)
+  and 16 nodes: all nodes to all nodes, random traffic checked against a model, hotspot, node cut
+  and back, cable cut and back (requests go around), smallest buffers, route packets in several
+  parts.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
   with the bit-level generic PHYs, and 4-node networks with one hardware sequencer per node.
 - `test_fabric_sim.py`: the same benches with Verilator (runs in CI): two nodes bit-level, and
   networks of 4, 8 and 16 nodes.
+
+`test/fabric_sim.py` runs the Migen simulator with a faster equivalent of its statement grouping
+(the original takes minutes to start on 8 nodes and more).
 
 Scope: simulation only. No FPGA synthesis, timing closure or hardware test. Links between more
 than two nodes are word-level (no PHY model).
