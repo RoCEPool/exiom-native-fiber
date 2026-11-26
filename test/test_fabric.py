@@ -109,28 +109,30 @@ class PacketFilter(LiteXModule):
 class DUT(LiteXModule):
     """Nodes A (id 1) and B (id 2), each with its memory."""
     def __init__(self, link="direct", size=128, requests=8, request_timeout=4096, buffer_depth=4,
-        queue_depth=2, fc_period=64, read_only=False, memory_timeout=128, loss=0, mem_kwargs={}):
+        queue_depth=2, fc_period=64, read_only=False, memory_timeout=128, loss=0, link_width=32,
+        mem_kwargs={}):
+        assert (link == "direct") or (link_width == 32)
         self.link_up = Signal(reset=1)
 
         # Nodes.
         node_kwargs = dict(size=size, requests=requests, request_timeout=request_timeout,
             memory_timeout=memory_timeout, buffer_depth=buffer_depth, queue_depth=queue_depth,
-            fc_period=fc_period, read_only=read_only, link_ready=self.link_up)
+            fc_period=fc_period, read_only=read_only, link_width=link_width, link_ready=self.link_up)
         self.a = FabricNode(node_id=1, **node_kwargs)
         self.b = FabricNode(node_id=2, **node_kwargs)
         self.a_mem = Memory(self.a.responder.mem, **mem_kwargs)
         self.b_mem = Memory(self.b.responder.mem, **mem_kwargs)
 
         # Packet drops (data packet of index `x2y.drop` of the direction).
-        a_source = stream.Endpoint(packet_description(32))
-        b_source = stream.Endpoint(packet_description(32))
+        a_source = stream.Endpoint(packet_description(link_width))
+        b_source = stream.Endpoint(packet_description(link_width))
         self.a2b = PacketFilter(self.a.source, a_source)
         self.b2a = PacketFilter(self.b.source, b_source)
         if loss:
             # Packets lost at random in both directions (`loss` out of 256).
             a_lossy, b_lossy = a_source, b_source
-            a_source = stream.Endpoint(packet_description(32))
-            b_source = stream.Endpoint(packet_description(32))
+            a_source = stream.Endpoint(packet_description(link_width))
+            b_source = stream.Endpoint(packet_description(link_width))
             self.a_lossy = FabricLossyLink(a_lossy, a_source, loss=loss, seed=1)
             self.b_lossy = FabricLossyLink(b_lossy, b_source, loss=loss, seed=2)
 
@@ -230,6 +232,37 @@ A, B = 1, 2
 class TestFabric(unittest.TestCase):
     def links(self):
         return ["direct", "serwb"]
+
+    def test_link_widths(self):
+        # 64 and 128 bits per cycle (a whole packet): same behavior, losses included.
+        for link_width in [64, 128]:
+            for loss in [0, 32]:
+                with self.subTest(link_width=link_width, loss=loss):
+                    dut = DUT(link_width=link_width, loss=loss, request_timeout=30000,
+                        mem_kwargs=dict(latency=2, hang_adr=20))
+                    def generator():
+                        tags = {}
+                        for adr in range(8):
+                            tags[(yield from request(dut.a, adr, we=1, dat_w=pattern(adr), dst=B))] = adr
+                        r = yield from results(dut.a, 8)
+                        self.assertTrue(all(v == (1, FABRIC_OK, 0) for v in r.values()))
+                        tags = {}
+                        for adr in [5, 2, 7, 0, 3, 6, 1, 4]:
+                            tags[(yield from request(dut.a, adr, dst=B))] = adr
+                        r = yield from results(dut.a, 8)
+                        for tag, adr in tags.items():
+                            self.assertEqual(r[tag], (0, FABRIC_OK, pattern(adr)))
+                        for adr, we, status in [(40, 1, FABRIC_RANGE), (40, 0, FABRIC_RANGE), (20, 1, FABRIC_TIMEOUT)]:
+                            tag = yield from request(dut.a, adr, we=we, dat_w=1, dst=B)
+                            self.assertEqual((yield from result(dut.a))[2], status)
+                        # Both directions, byte enables.
+                        self.assertEqual((yield from write(dut.b, A, 3, 0xffffffff, sel=0b0110)), FABRIC_OK)
+                        self.assertEqual((yield from read(dut.b, A, 3)), (0x00ffff00, FABRIC_OK))
+                        self.assertEqual((yield dut.b.responder.requests), 8 + 8 + 3)
+                        self.assertEqual((yield dut.a.requester.stale), 0)
+                        for node in [dut.a, dut.b]:
+                            self.assertEqual((yield node.ports[0].rx_invalid), 0)
+                    run_simulation(dut, generator())
 
     def test_read_write(self):
         for link in self.links():
@@ -584,18 +617,20 @@ class TestFabric(unittest.TestCase):
             yield from send([route | (2 << 16), 0xf14, 4])            # Hop limit above max_hops.
             yield from send([route, (1 << 12) | (0xf << 8) | 0x12, 4, 0xdead, 0xbeef, 0xcafe]) # Too long.
             yield from send([route | seq(0), (1 << 12) | (0xf << 8) | 0x11]) # Write without address.
+            yield from send([route | seq(0), (0xf << 8) | 0x16, 4, 0x1234])  # Read with data.
             yield from wait(64)
-            self.assertEqual((yield dut.b.ports[0].rx_invalid), 5)
-            self.assertEqual((yield dut.b.responder.malformed), 1)
+            # Not accepted by the port (so sent again on a real link), nothing reaches the Responder.
+            self.assertEqual((yield dut.b.ports[0].rx_invalid), 7)
+            self.assertEqual((yield dut.b.responder.malformed), 0)
             self.assertEqual((yield dut.b.responder.requests), 0)
             self.assertEqual((yield dut.b_mem.mem[4]), 0)
             # Valid write then read still served.
             # Not the sequence number expected, and a write whose data would be seen.
-            yield from send([route | seq(4), (1 << 12) | (0xf << 8) | 0x15, 5, 0x5555])
+            yield from send([route | seq(3), (1 << 12) | (0xf << 8) | 0x15, 5, 0x5555])
             # Valid write then read still served.
-            yield from send([route | seq(1), (1 << 12) | (0xf << 8) | 0x13, 4, 0x4444])
-            yield from send([route | seq(2), (0xf << 8) | 0x14, 4])
-            yield from send([route | seq(1), (1 << 12) | (0xf << 8) | 0x13, 4, 0x9999]) # Sent again: discarded.
+            yield from send([route | seq(0), (1 << 12) | (0xf << 8) | 0x13, 4, 0x4444])
+            yield from send([route | seq(1), (0xf << 8) | 0x14, 4])
+            yield from send([route | seq(0), (1 << 12) | (0xf << 8) | 0x13, 4, 0x9999]) # Sent again: discarded.
             yield from wait(64)
             self.assertEqual((yield dut.b_mem.mem[4]), 0x4444)
             self.assertEqual((yield dut.b_mem.mem[5]), 0)
