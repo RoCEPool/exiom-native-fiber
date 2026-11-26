@@ -1,0 +1,78 @@
+name: nightly
+
+# Longest simulations of the project (test/nightly.py: 8 and 16 nodes, networks with losses, wide
+# links at scale), with all the other tests: every night on the default branch, and by hand
+# (workflow_dispatch). The tests of every push and pull request are in ci.yml.
+
+on:
+  schedule:
+    - cron: "0 17 * * *" # 02:00 JST.
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      # Checkout Repository
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install Tools
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install wget build-essential help2man
+          sudo apt-get install libevent-dev libjson-c-dev flex bison
+          sudo apt-get install libfl-dev libfl2 zlib1g-dev
+          sudo apt-get install yosys
+
+      # Cache Verilator install (same pinned version and cache as ci.yml).
+      - name: Cache Verilator install
+        id: verilator-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/verilator-install
+          key: verilator-ubuntu22-7d2d32420a630befa4097170ecbf227e04e32522
+
+      # Build / Install Verilator (only on cache miss).
+      - name: Build Verilator
+        if: steps.verilator-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/verilator/verilator
+          cd verilator
+          git checkout 7d2d32420a630befa4097170ecbf227e04e32522
+          autoconf
+          ./configure --prefix=/tmp/verilator-install
+          make -j$(nproc)
+          make install
+
+      - name: Install Verilator into /usr/local
+        run: sudo cp -a /tmp/verilator-install/. /usr/local/
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: "pip"
+          cache-dependency-path: "setup.py"
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install setuptools pytest
+
+      # Install (n)Migen / LiteX / Cores
+      - name: Install LiteX
+        run: |
+          wget https://raw.githubusercontent.com/enjoy-digital/litex/master/litex_setup.py
+          python3 litex_setup.py --clone-depth=1 init install --user
+
+      # Install Project
+      - name: Install Project
+        run: python3 setup.py develop --user
+
+      # Test (nightly tests included)
+      - name: Run Tests
+        env:
+          EXIOM_NIGHTLY: "1"
+        run: python3 -m pytest -v --durations=15

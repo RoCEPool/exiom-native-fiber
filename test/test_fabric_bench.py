@@ -22,6 +22,8 @@ from litex.gen.sim import *
 
 from exiom.fabric import *
 
+from test.nightly import nightly
+
 # After the other imports (run_simulation is also exported by litex.gen).
 from test.fabric_sim import run_simulation # Same simulator, starts faster on large designs.
 
@@ -175,6 +177,7 @@ class TestFabricNetworkBench(unittest.TestCase):
     def test_4_nodes_small_buffers(self):
         self.run_bench(nodes=4, sram_latency=20, queue_depth=1, buffer_depth=2)
 
+    @nightly
     def test_8_nodes(self):
         # Two groups, up to 3 links, the node with the cable between the groups cut and back.
         sim, dut, results = self.run_bench(nodes=8, sram_latency=8)
@@ -186,8 +189,11 @@ class TestFabricNetworkBench(unittest.TestCase):
         sim, dut, results = self.run_bench(nodes=4, loss=26, scenarios=["all", "hotspot", "errors"])
 
     def test_4_nodes_wide(self):
-        # 128 bits per cycle on the links, with and without losses.
+        # 128 bits per cycle on the links.
         self.run_bench(nodes=4, link_width=128)
+
+    @nightly
+    def test_4_nodes_wide_lossy(self):
         self.run_bench(nodes=4, link_width=64, loss=26, scenarios=["all", "hotspot", "errors"])
 
     def test_4_nodes_hypercube(self):
