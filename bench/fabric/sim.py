@@ -30,6 +30,7 @@ one hardware sequencer per node:
             forwarded over up to 3 links).
 - hotspot : all the nodes write node 0 together.
 - errors  : out of window and unknown node.
+  With --loss, every link loses packets at random: they are sent again by the links.
 - down    : one node is cut from the fabric: once the routes have followed, requests to it are
             answered with an error and the others are served by the paths that are left; then the
             node comes back.
@@ -409,7 +410,7 @@ class FabricTestBench(LiteXModule):
 class FabricNetworkBench(LiteXModule):
     """The nodes of a topology (word-level links) and one self-checking sequencer per node."""
     def __init__(self, nodes=4, topology="two_tier", scenarios=NETWORK_SCENARIOS, down=None, sram_latency=0,
-        queue_depth=2, buffer_depth=4, timeout=4000000):
+        queue_depth=2, buffer_depth=4, loss=0, timeout=4000000):
         self.done        = Signal()
         self.errors      = Signal(32)
         self.failed_node = Signal(8)
@@ -439,6 +440,7 @@ class FabricNetworkBench(LiteXModule):
             memory_timeout  = 256,
             queue_depth     = queue_depth,
             buffer_depth    = buffer_depth,
+            loss            = loss,
         )
         if down is not None:
             for up in net.node_links(down):
@@ -557,6 +559,7 @@ def main():
     parser.add_argument("--topology",          default="two_tier",          help="Network: topology (two_tier or hypercube).")
     parser.add_argument("--down",              default=None, type=int,      help="Network: node cut by the down scenario.")
     parser.add_argument("--queue-depth",       default=2, type=int,         help="Network: packets per class in the ports.")
+    parser.add_argument("--loss",              default=0, type=int,         help="Network: packets lost on each link, out of 256.")
     parser.add_argument("--scenarios",         default=None,                help="Scenarios to run (comma separated).")
     parser.add_argument("--sram-latency",      default=0, type=int,         help="SRAM ack latency (cycles).")
     parser.add_argument("--with-flow-control", action="store_true",         help="Two nodes: enable PHY flow control.")
@@ -588,6 +591,7 @@ def main():
             down         = args.down,
             sram_latency = args.sram_latency,
             queue_depth  = args.queue_depth,
+            loss         = args.loss,
         )
     builder = Builder(soc, output_dir=args.output_dir, csr_csv=None)
     builder.build(sim_config=sim_config,

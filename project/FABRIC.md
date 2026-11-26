@@ -73,7 +73,7 @@ Paths left with one node down (`test_one_node_down`):
 
 | Word | Content |
 |------|---------|
-| 0 (route) | `[7:0]` destination node, `[15:8]` source node, `[23:16]` hop limit, `[24]` response, `[25]` flow control, `[31:28]` magic |
+| 0 (route) | `[7:0]` destination node, `[15:8]` source node, `[18:16]` hop limit, `[23:19]` sequence number on the link, `[24]` response, `[25]` flow control, `[26]` routes, `[31:28]` magic |
 | 1 (transaction) | `[7:0]` tag, `[11:8]` byte enables (request) or status (response), `[12]` write |
 | 2 | Word address in the destination window (request), read data (response) |
 | 3 | Write data (write request) |
@@ -98,13 +98,30 @@ Paths left with one node down (`test_one_node_down`):
   links crossed" of the next node; requests wait for responses, and responses are always accepted
   by their Requester. No cycle of packets waiting for each other can form, whatever the topology
   and the routes.
-- **Lost packets**: a packet lost on a link (CRC error) is counted as sent and never as received.
-  When a class has not sent anything for `4*fc_period` cycles, S is set back to the last R
-  received (`resyncs` counter).
+- A packet that does not fit in its queue is not accepted, and is sent again (see below).
 - Link down: the queues and the credits of the port are reset, packets for this port are
   discarded instead of stalling the node.
 
 Cost: `2 * max_hops` queues per port (10 with a hop limit of 5), `queue_depth` packets each.
+
+## Retransmission: packets lost on a link are sent again
+
+- Each port numbers the packets it sends (5-bit sequence number) and keeps up to 8 of them until
+  its neighbor has acknowledged them. Flow control packets carry the acknowledgment: the next
+  sequence number the neighbor expects.
+- A port only accepts the packet it expects. After a lost packet, the following ones are
+  discarded and the sender starts again from the missing one: at once when a later packet shows
+  the gap (the flow control packet asks for it), or after `retry_timeout` cycles without
+  acknowledgment (last packet lost, or acknowledgment lost).
+- Result: packets are delivered once and in order on every link, so a request is executed once
+  and requests from one node to another stay in order, on links that lose packets.
+- Flow control and route packets are not numbered: they carry a state, and the next one replaces
+  a lost one.
+- Not covered: packets in a node or on a link that goes down are lost (their requests end with
+  `FABRIC_NODE` or `FABRIC_NO_RESPONSE`), and requests are not sent again end to end. A link that
+  stays up without passing any packet is retried forever.
+
+Counters per port: `retransmits`, `rx_discards`.
 
 ## Throughput
 
@@ -164,7 +181,8 @@ have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
 
 ## Limits
 
-- No retransmission: errors are reported, the user decides.
+- Retransmission is per link: a request lost with a node or a link that goes down is reported,
+  the user decides.
 - A node only learns the state of the fabric from its neighbors: while a change spreads,
   requests can fail (see above).
 - At most 6 links on a path (12 classes per port, one flow control packet). Distances are 3-bit.
@@ -183,12 +201,14 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   with any one node down.
 - `test_fabric.py`: two nodes, connected directly and through SerWB (word-level PHY model):
   requests in flight, queueing, both directions, errors isolated to their request, lost request,
-  lost response, late response, link down (with a sweep of the moment the link is lost),
-  backpressure with the smallest buffers, credit recovery, invalid packets, Wishbone.
+  late response, link down (with a sweep of the moment the link is lost), backpressure with the
+  smallest buffers, invalid packets, Wishbone. Packets lost: a request, a response, several in
+  a row, flow control packets, and one packet out of 8 at random in both directions: everything
+  executed once, in order, nothing reported lost.
 - `test_fabric_network.py`: 4 nodes (two-tier and hypercube), 8 nodes (cabled for 16 and for 8)
   and 16 nodes: all nodes to all nodes, random traffic checked against a model, hotspot, node cut
   and back, cable cut and back (requests go around), smallest buffers, route packets in several
-  parts.
+  parts, and 4 and 8 nodes with one packet out of 10 lost on every link.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
   with the bit-level generic PHYs, and 4-node networks with one hardware sequencer per node.
 - `test_fabric_sim.py`: the same benches with Verilator (runs in CI): two nodes bit-level, and

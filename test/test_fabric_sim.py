@@ -36,6 +36,7 @@ CONFIGS = {
     "4_nodes_small_buffers": ["--nodes", "4", "--queue-depth", "1", "--sram-latency", "20"],
     "8_nodes"              : ["--nodes", "8", "--sram-latency", "8"],
     "8_nodes_hypercube"    : ["--nodes", "8", "--topology", "hypercube"],
+    "8_nodes_lossy"        : ["--nodes", "8", "--loss", "26", "--scenarios", "all,hotspot,errors"],
     # 16 nodes: with the Migen simulator (test_fabric_network.py); their Verilator build needs more
     # memory than the CI runner has (./bench/fabric/sim.py --nodes 16 on a larger machine).
 }

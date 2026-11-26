@@ -318,6 +318,37 @@ class TestFabricNetwork(unittest.TestCase):
             hotspot(self, dut),
         ])
 
+    def lossy(self, dut, generators):
+        """Runs on links that lose packets: nothing may be lost end to end."""
+        def check():
+            dropped, retransmits = 0, 0
+            for link in dut.net.lossy:
+                dropped += (yield link.dropped)
+            for node in dut.nodes:
+                for port in node.ports:
+                    retransmits += (yield port.retransmits)
+            self.assertGreater(dropped, 20)
+            self.assertGreater(retransmits, 0)
+        run(dut, generators + [check()])
+
+    def test_4_nodes_lossy(self):
+        # One packet out of 10 lost on every link, in both directions.
+        dut = DUT(two_tier(4), loss=26, request_timeout=60000)
+        self.lossy(dut, [
+            all_to_all(self, dut, check_hops=False),
+            random_traffic(self, dut, requests=32),
+            hotspot(self, dut),
+        ])
+
+    def test_8_nodes_lossy(self):
+        # Packets forwarded over up to 3 lossy links, smallest buffers.
+        dut = DUT(two_tier(8), loss=26, buffer_depth=2, queue_depth=1, request_timeout=60000)
+        self.lossy(dut, [
+            all_to_all(self, dut),
+            random_traffic(self, dut, requests=16),
+            hotspot(self, dut, writes=3),
+        ])
+
     def test_4_nodes_hypercube(self):
         # Other topology (2 links between opposite nodes): same nodes, other routes.
         dut = DUT(hypercube(4))

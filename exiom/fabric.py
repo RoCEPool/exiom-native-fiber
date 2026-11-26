@@ -15,9 +15,9 @@ Fabric only needs a packet stream per port (``packet_description(32)``: a SerWB 
 
 Packet (32-bit words, 2 to 4 words):
 
-- Word 0 (route)       : [7:0] destination node, [15:8] source node, [23:16] hop limit,
-                         [24] response, [25] flow control, [26] routes, [31:28] magic. Only word
-                         used to forward a packet.
+- Word 0 (route)       : [7:0] destination node, [15:8] source node, [18:16] hop limit,
+                         [23:19] sequence number on the link, [24] response, [25] flow control,
+                         [26] routes, [31:28] magic. Only word used to forward a packet.
 - Word 1 (transaction) : [7:0] tag, [11:8] byte enables (request) or status (response),
                          [12] write.
 - Word 2               : word address in the destination window (request) or read data (response).
@@ -48,8 +48,13 @@ Forwarding, flow control and deadlock freedom:
   the link. Each port regularly sends a flow control packet with, per class, the number of packets
   received (R) and the number of packets it accepts in total (L = R + free places); the sender
   compares L with the number of packets it sent (S). Packets are never dropped for lack of room.
-- Packets lost on a link (CRC error) are counted as sent and never received: when a class has
-  not sent anything for ``4*fc_period`` cycles, S is set back to the last R received.
+- Retransmission: each port numbers the packets it sends and keeps them until its neighbor has
+  acknowledged them (flow control packets carry the next sequence number expected). A port only
+  accepts the packet it expects: after a packet lost on the link (CRC error), the following ones
+  are discarded, the neighbor is asked to send again from the missing one (at once when a later
+  packet shows the gap, after ``retry_timeout`` cycles without acknowledgment otherwise), and
+  packets are delivered once and in order. Flow control and route packets are not numbered: they
+  carry a state, the next one replaces a lost one.
 
 Semantics:
 
@@ -62,9 +67,10 @@ Semantics:
   the links of their route do not change state. Results are returned as they complete, identified
   by their tag.
 - FABRIC_NO_RESPONSE and FABRIC_LINK mean "not confirmed": the request may have been executed.
-- No retransmission. While a change of the fabric spreads (a few route packet periods), packets
-  can be sent towards a link that is down: they are answered with FABRIC_NODE or lost
-  (FABRIC_NO_RESPONSE).
+- Packets lost on a link are sent again by the link. Packets in a node or on a link that goes
+  down are lost, and while this change spreads in the fabric (a few route packet periods),
+  packets can be sent towards the link that is down: their requests end with FABRIC_NODE or
+  FABRIC_NO_RESPONSE. Requests are not sent again end to end.
 """
 
 from migen import *
@@ -104,11 +110,15 @@ def fabric_packet_layout():
     return [("w0", 32), ("w1", 32), ("w2", 32), ("w3", 32), ("len", 3)]
 
 def route_word(dst, src, ttl, rsp):
-    return Cat(dst, src, ttl, rsp, Constant(0, 3), Constant(FABRIC_MAGIC, 4))
+    return Cat(dst, src, ttl[:3] if isinstance(ttl, Signal) else Constant(ttl, 3), Constant(0, 5), rsp,
+        Constant(0, 3), Constant(FABRIC_MAGIC, 4))
+
+FABRIC_WINDOW = 8 # Packets sent and not yet acknowledged, per port.
 
 def route_dst(w0):   return w0[0:8]
 def route_src(w0):   return w0[8:16]
-def route_ttl(w0):   return w0[16:24]
+def route_ttl(w0):   return w0[16:19]
+def route_seq(w0):   return w0[19:24]
 def route_rsp(w0):   return w0[24]
 def route_fc(w0):    return w0[25]
 def route_rt(w0):    return w0[26]
@@ -459,7 +469,7 @@ class FabricRequester(LiteXModule):
             ),
             If(alloc,
                 tx_valid.eq(send),
-                tx.w0.eq(route_word(sink.dst, Constant(node_id, 8), Constant(max_hops, 8), 0)),
+                tx.w0.eq(route_word(sink.dst, Constant(node_id, 8), max_hops, 0)),
                 tx.w1.eq(Cat(tag, sink.sel, sink.we)),
                 tx.w2.eq(sink.adr),
                 tx.w3.eq(sink.dat_w),
@@ -520,7 +530,7 @@ class FabricResponder(LiteXModule):
             mem.we.eq(we),
             mem.sel.eq(sel),
             mem.dat_w.eq(dat_w),
-            tx.w0.eq(route_word(src, Constant(node_id, 8), Constant(max_hops, 8), 1)),
+            tx.w0.eq(route_word(src, Constant(node_id, 8), max_hops, 1)),
             tx.w1.eq(Cat(tag, status, we)),
             tx.w2.eq(dat_r),
             tx.len.eq(Mux(we, 2, 3)),
@@ -579,15 +589,19 @@ class FabricResponder(LiteXModule):
 # Fabric Port --------------------------------------------------------------------------------------
 
 class FabricPort(LiteXModule):
-    """Link to a neighbor: packet stream <-> whole packets, receive queues per class, credits.
+    """Link to a neighbor: packet stream <-> whole packets, receive queues per class, credits,
+    retransmission.
 
     ``sink``/``source``: packet stream from/to the neighbor. ``queues[c]``: packets received in
     class c (c = response*max_hops + links crossed - 1). ``tx``: packet to send in class
-    ``tx_class`` (accepted when the port is free; the switch checks ``credit[tx_class]`` first).
+    ``tx_class`` (accepted when the port has room; the switch checks ``credit[tx_class]`` first).
     ``ctl``/``rt``: route packets to send (between two packets, without credit) and received.
+    ``retry_timeout``: cycles without acknowledgment before the packets not acknowledged are sent
+    again (default: ``fc_period``).
     """
-    def __init__(self, max_hops=1, queue_depth=4, fc_period=256, link_ready=None):
+    def __init__(self, max_hops=1, queue_depth=4, fc_period=256, retry_timeout=None, link_ready=None):
         assert 1 <= max_hops <= 6 and 1 <= queue_depth <= 8 and fc_period >= 16
+        retry_timeout = fc_period if retry_timeout is None else retry_timeout
         self.classes  = classes = 2*max_hops
         self.sink     = sink    = stream.Endpoint(packet_description(32))
         self.source   = source  = stream.Endpoint(packet_description(32))
@@ -603,7 +617,9 @@ class FabricPort(LiteXModule):
         self.rx_invalid = rx_invalid = Signal(32) # Packets dropped (not a fabric packet, malformed).
         self.rx_drops   = rx_drops   = Signal(32) # Packets dropped (queue full: credits not respected).
         self.tx_drops   = tx_drops   = Signal(32) # Packets dropped (link down).
-        self.resyncs    = resyncs    = Signal(32) # Credits recovered after packets lost on the link.
+        self.resyncs    = resyncs    = Signal(32) # Credits recovered (packets never delivered).
+        self.retransmits = retransmits = Signal(32) # Times packets were sent again.
+        self.rx_discards = rx_discards = Signal(32) # Packets discarded (not the one expected).
 
         # # #
 
@@ -646,7 +662,7 @@ class FabricPort(LiteXModule):
         rx_data  = Signal()
         rx_ok    = Signal()
         rx_class = Signal(max=classes)
-        rx_ttl   = Signal(8)
+        rx_ttl   = Signal(3)
         self.comb += [
             rx_ttl.eq(route_ttl(rx.w0)),
             rx_ok.eq(rx.valid & (route_magic(rx.w0) == FABRIC_MAGIC)),
@@ -665,6 +681,21 @@ class FabricPort(LiteXModule):
             )
         ]
 
+        # RX: Sequence. Only the packet expected is accepted.
+        # ---------------------------------------------------
+        self.rx_expected = rx_expected = Signal(5) # Sequence number of the next packet to receive.
+        rx_ahead    = Signal(5)
+        rx_in_seq   = Signal()
+        rx_future   = Signal() # A packet before this one was lost.
+        rx_past     = Signal() # Already received (sent again).
+        rx_accepted = Signal()
+        self.comb += [
+            rx_ahead.eq(route_seq(rx.w0) - rx_expected),
+            rx_in_seq.eq(rx_data & (rx_ahead == 0)),
+            rx_future.eq(rx_data & (rx_ahead != 0) & ~rx_ahead[4]),
+            rx_past.eq(rx_data & rx_ahead[4]),
+        ]
+
         # RX: Queues and receiver side of the credits (R: packets received, L: R + free places).
         # ---------------------------------------------------------------------------------------
         # Counters are 4-bit (modulo 16, queue_depth <= 8): a flow control word carries 4 classes.
@@ -672,26 +703,68 @@ class FabricPort(LiteXModule):
         rx_l  = [Signal(4, name=f"rx_l{c}") for c in range(classes)]
         dirty = Signal() # A place was freed since the last flow control packet.
         freed = Signal()
-        stores = []
+        stores  = []
+        refused = []
         for c in range(classes):
             fifo = ResetInserter()(stream.SyncFIFO(fabric_packet_layout(), queue_depth, buffered=True))
             self.add_module(f"queue{c}", fifo)
             queues.append(fifo.source)
             store = Signal(name=f"rx_store{c}")
-            stores.append(store & ~fifo.sink.ready)
+            stores.append(store & fifo.sink.ready)
+            refused.append(store & ~fifo.sink.ready)
             self.comb += [
                 fifo.reset.eq(~up),
-                store.eq(rx_data & (rx_class == c)),
+                store.eq(rx_in_seq & (rx_class == c)),
                 rx.connect(fifo.sink, omit={"valid", "ready"}),
                 fifo.sink.valid.eq(store),
                 rx_l[c].eq(rx_r[c] + (queue_depth - fifo.level)),
                 If(fifo.source.valid & fifo.source.ready, freed.eq(1)),
             ]
             self.sync += [
-                If(store, rx_r[c].eq(rx_r[c] + 1)),
-                If(~up,   rx_r[c].eq(0)),
+                If(store & fifo.sink.ready, rx_r[c].eq(rx_r[c] + 1)),
+                If(~up, rx_r[c].eq(0)),
             ]
-        self.sync += If(Cat(*stores) != 0, If(rx_drops != (2**32 - 1), rx_drops.eq(rx_drops + 1)))
+        # A packet that does not fit (credits not respected) is not accepted: it is sent again.
+        self.comb += rx_accepted.eq(Cat(*stores) != 0)
+        self.sync += [
+            If(Cat(*refused) != 0, If(rx_drops != (2**32 - 1), rx_drops.eq(rx_drops + 1))),
+            If(rx_future | rx_past, If(rx_discards != (2**32 - 1), rx_discards.eq(rx_discards + 1))),
+        ]
+
+        # RX: Acknowledgments, sent in the flow control packets.
+        # -------------------------------------------------------
+        fc_sent    = Signal()
+        ack_due    = Signal()                        # Packets received since the last one.
+        ack_count  = Signal(max=FABRIC_WINDOW + 1)
+        nack       = Signal()                        # Gap seen: ask to send again from rx_expected.
+        nack_done  = Signal()                        # Asked for this gap.
+        self.sync += [
+            If(fc_sent,
+                ack_due.eq(0),
+                ack_count.eq(0),
+                nack.eq(0),
+            ),
+            If(rx_accepted,
+                rx_expected.eq(rx_expected + 1),
+                nack_done.eq(0),
+                ack_due.eq(1),
+                If(ack_count != FABRIC_WINDOW, ack_count.eq(ack_count + 1)),
+            ),
+            If(rx_past,
+                ack_due.eq(1) # Its acknowledgment was lost.
+            ),
+            If(rx_future & ~nack_done,
+                nack.eq(1),
+                nack_done.eq(1),
+            ),
+            If(~up,
+                rx_expected.eq(0),
+                ack_due.eq(0),
+                ack_count.eq(0),
+                nack.eq(0),
+                nack_done.eq(0),
+            )
+        ]
 
         # TX: Sender side of the credits (S: packets sent, R/L: last values from the neighbor).
         # --------------------------------------------------------------------------------------
@@ -700,9 +773,13 @@ class FabricPort(LiteXModule):
         tx_l     = [Signal(4, reset=queue_depth, name=f"tx_l{c}") for c in range(classes)]
         tx_idle  = [Signal(max=4*fc_period + 1, name=f"tx_idle{c}") for c in range(classes)]
         fc_len   = 1 + (classes + 3)//4
+        fc_ok    = Signal() # Flow control packet received.
         sent     = Signal()
         resynced = []
-        self.comb += sent.eq(tx.valid & tx.ready & up)
+        self.comb += [
+            sent.eq(tx.valid & tx.ready & up),
+            fc_ok.eq(rx_fc & (rx.len == fc_len)),
+        ]
         for c in range(classes):
             room   = Signal(4, name=f"tx_room{c}")
             resync = Signal(name=f"tx_resync{c}")
@@ -714,7 +791,7 @@ class FabricPort(LiteXModule):
             self.comb += [
                 room.eq(tx_l[c] - tx_s[c]),
                 credit[c].eq((room != 0) & (room <= queue_depth)),
-                # Nothing sent for a long time: packets sent and not received are lost.
+                # Nothing sent for a long time: packets sent and not received will never be.
                 resync.eq((tx_idle[c] == 4*fc_period) & (tx_s[c] != tx_r[c]) & ~(sent & (self.tx_class == c))),
             ]
             self.sync += [
@@ -726,7 +803,7 @@ class FabricPort(LiteXModule):
                 ).Elif(resync,
                     tx_s[c].eq(tx_r[c]),
                 ),
-                If(rx_fc & (rx.len == fc_len),
+                If(fc_ok,
                     tx_r[c].eq(fc_r),
                     tx_l[c].eq(fc_l),
                 ),
@@ -739,26 +816,95 @@ class FabricPort(LiteXModule):
             ]
         self.sync += If((Cat(*resynced) != 0) & up, If(resyncs != (2**32 - 1), resyncs.eq(resyncs + 1)))
 
-        # TX: Whole packets and flow control packets to the packet stream.
-        # -----------------------------------------------------------------
-        hold       = stream.Endpoint(fabric_packet_layout()) # Packet being sent.
-        hold_valid = Signal()
-        packet_done = Signal()
-        # A packet is taken when the previous one leaves. Link down: packets are dropped instead of
-        # stalling the node.
-        self.comb += tx.ready.eq(~hold_valid | packet_done | ~up)
+        # TX: Packets sent, kept until acknowledged.
+        # -------------------------------------------
+        # Sequence numbers: tx_acked (oldest not acknowledged) <= tx_send (next to send) <= tx_tail
+        # (next to number), modulo 32.
+        window   = FABRIC_WINDOW
+        slot     = bits_for(window - 1)
+        self.tx_acked = tx_acked = Signal(5)
+        self.tx_send  = tx_send  = Signal(5)
+        self.tx_tail  = tx_tail  = Signal(5)
+        tx_cur   = Signal(5) # Packet being sent.
+        kept     = Signal(5)
+        buf      = [[Signal(32, name=f"tx_buf{i}_w{w}") for i in range(window)] for w in range(4)]
+        buf_len  = [Signal(3, name=f"tx_buf{i}_len") for i in range(window)]
+        self.comb += [
+            kept.eq(tx_tail - tx_acked),
+            # Link down: packets are dropped instead of stalling the node.
+            tx.ready.eq((kept < window) | ~up),
+        ]
+        for i in range(window):
+            self.sync += If(sent & (tx_tail[:slot] == i),
+                buf[0][i].eq(Cat(tx.w0[:19], tx_tail, tx.w0[24:])),
+                buf[1][i].eq(tx.w1),
+                buf[2][i].eq(tx.w2),
+                buf[3][i].eq(tx.w3),
+                buf_len[i].eq(tx.len),
+            )
+        self.sync += If(tx.valid & tx.ready & ~up, If(tx_drops != (2**32 - 1), tx_drops.eq(tx_drops + 1)))
+
+        # Acknowledgments from the neighbor.
+        ack       = Signal(5)
+        ack_delta = Signal(5)
+        ack_ok    = Signal()
+        progress  = Signal()
+        acked_n   = Signal(5)
+        self.comb += [
+            ack.eq(rx.w0[0:5]),
+            ack_delta.eq(ack - tx_acked),
+            ack_ok.eq(fc_ok & (ack_delta <= kept)),
+            progress.eq(ack_ok & (ack_delta != 0)),
+            acked_n.eq(Mux(progress, ack, tx_acked)),
+        ]
+
+        # Sending again: asked by the neighbor, or nothing acknowledged for too long.
+        self.retry_timer = retry_timer = WaitTimer(retry_timeout)
+        rewind       = Signal() # To do when no packet is being sent.
+        rewind_apply = Signal()
+        packet_done  = Signal()
+        send_n       = Signal(5)
+        behind       = Signal(5)
+        self.comb += [
+            retry_timer.wait.eq((tx_acked != tx_tail) & ~progress & ~rewind_apply),
+            send_n.eq(Mux(rewind_apply, acked_n, Mux(packet_done, tx_cur + 1, tx_send))),
+            behind.eq(send_n - acked_n),
+        ]
+        self.sync += [
+            tx_acked.eq(acked_n),
+            # A packet acknowledged while it was being sent again is not sent further.
+            tx_send.eq(Mux(behind[4], acked_n, send_n)),
+            If(sent, tx_tail.eq(tx_tail + 1)),
+            If((ack_ok & rx.w0[5]) | retry_timer.done,
+                rewind.eq(1)
+            ),
+            If(rewind_apply,
+                rewind.eq((ack_ok & rx.w0[5])),
+                If(retransmits != (2**32 - 1), retransmits.eq(retransmits + 1)),
+            ),
+            If(~up,
+                tx_acked.eq(0),
+                tx_send.eq(0),
+                tx_tail.eq(0),
+                rewind.eq(0),
+            )
+        ]
+
+        # TX: Packets, flow control packets and route packets to the packet stream.
+        # --------------------------------------------------------------------------
+        available = Signal() # A packet to send.
+        self.comb += available.eq(tx_send != tx_tail)
 
         fc_words = [Signal(32, name=f"fc_w{i}") for i in range(4)]
-        self.comb += fc_words[0].eq((FABRIC_MAGIC << 28) | (1 << 25))
+        self.comb += fc_words[0].eq((FABRIC_MAGIC << 28) | (1 << 25) | (nack << 5) | rx_expected)
         for c in range(classes):
             self.comb += [
                 fc_words[1 + c//4][8*(c % 4) + 0:8*(c % 4) + 4].eq(rx_r[c]),
                 fc_words[1 + c//4][8*(c % 4) + 4:8*(c % 4) + 8].eq(rx_l[c]),
             ]
         self.fc_timer    = fc_timer    = WaitTimer(fc_period)    # Periodic flow control packet.
-        self.dirty_timer = dirty_timer = WaitTimer(fc_period//8) # Places freed: sooner.
+        self.dirty_timer = dirty_timer = WaitTimer(fc_period//8) # Something to tell: sooner.
         fc_request = Signal()
-        fc_sent    = Signal()
         # Places freed in a class for which the neighbor was told it has none left: it is waiting.
         rx_l_sent  = [Signal(4, reset=queue_depth, name=f"rx_l_sent{c}") for c in range(classes)]
         starving   = Signal()
@@ -769,8 +915,11 @@ class FabricPort(LiteXModule):
         ]
         self.comb += [
             fc_timer.wait.eq(~fc_sent),
-            dirty_timer.wait.eq(dirty & ~fc_sent),
-            fc_request.eq(fc_timer.done | starving | (dirty & (~hold_valid | dirty_timer.done))),
+            dirty_timer.wait.eq((dirty | ack_due) & ~fc_sent),
+            # At once: neighbor waiting for credits, packets to send again, half of the packets the
+            # neighbor may keep received. Otherwise when the link is free, or after a while.
+            fc_request.eq(fc_timer.done | starving | nack | (ack_count >= window//2) |
+                ((dirty | ack_due) & (~available | dirty_timer.done))),
         ]
         self.sync += [
             If(fc_sent,
@@ -782,9 +931,16 @@ class FabricPort(LiteXModule):
         ]
 
         index      = Signal(2)
-        words      = Array([hold.w0, hold.w1, hold.w2, hold.w3])
+        cur_slot   = Signal(slot)
+        cur_len    = Signal(3)
+        send_slot  = Signal(slot)
         fc_latched = [Signal(32, name=f"fc_l{i}") for i in range(4)]
         self.sync += If(fc_sent, *[fc_latched[i].eq(fc_words[i]) for i in range(4)])
+        self.comb += [
+            send_slot.eq(tx_send[:slot]),
+            cur_slot.eq(tx_cur[:slot]),
+            cur_len.eq(Array(buf_len)[cur_slot]),
+        ]
         self.tx_fsm = tx_fsm = ResetInserter()(FSM(reset_state="IDLE"))
         self.comb += tx_fsm.reset.eq(~up)
         ctl_words = [Signal(32, name=f"ctl_w{i}") for i in range(4)]
@@ -794,6 +950,8 @@ class FabricPort(LiteXModule):
             If(fc_request,
                 fc_sent.eq(1),
                 NextState("FLOW-CONTROL")
+            ).Elif(rewind,
+                rewind_apply.eq(1)
             ).Elif(ctl.valid,
                 ctl.ready.eq(1),
                 NextValue(ctl_words[0], ctl.w0),
@@ -802,11 +960,12 @@ class FabricPort(LiteXModule):
                 NextValue(ctl_words[3], ctl.w3),
                 NextValue(ctl_len,      ctl.len),
                 NextState("CONTROL")
-            ).Elif(hold_valid,
+            ).Elif(available,
                 # First word of the packet: once presented, the packet is sent before anything else.
                 source.valid.eq(1),
-                source.length.eq(Cat(Constant(0, 2), hold.len)),
-                source.data.eq(hold.w0),
+                source.length.eq(Cat(Constant(0, 2), Array(buf_len)[send_slot])),
+                source.data.eq(Array(buf[0])[send_slot]),
+                NextValue(tx_cur, tx_send),
                 If(source.ready, NextValue(index, 1)),
                 NextState("PACKET")
             )
@@ -833,9 +992,9 @@ class FabricPort(LiteXModule):
         )
         tx_fsm.act("PACKET",
             source.valid.eq(1),
-            source.length.eq(Cat(Constant(0, 2), hold.len)),
-            source.data.eq(words[index]),
-            source.last.eq(index == (hold.len - 1)),
+            source.length.eq(Cat(Constant(0, 2), cur_len)),
+            source.data.eq(Array([Array(buf[w])[cur_slot] for w in range(4)])[index]),
+            source.last.eq(index == (cur_len - 1)),
             If(source.ready,
                 NextValue(index, index + 1),
                 If(source.last,
@@ -844,24 +1003,6 @@ class FabricPort(LiteXModule):
                 )
             )
         )
-        self.sync += [
-            If(packet_done,
-                hold_valid.eq(0)
-            ),
-            If(tx.valid & tx.ready,
-                If(up,
-                    hold_valid.eq(1),
-                    hold.w0.eq(tx.w0),
-                    hold.w1.eq(tx.w1),
-                    hold.w2.eq(tx.w2),
-                    hold.w3.eq(tx.w3),
-                    hold.len.eq(tx.len),
-                ).Elif(tx_drops != (2**32 - 1),
-                    tx_drops.eq(tx_drops + 1)
-                )
-            ),
-            If(~up, hold_valid.eq(0)),
-        ]
 
 # Fabric Node --------------------------------------------------------------------------------------
 
@@ -882,6 +1023,7 @@ class FabricNode(LiteXModule):
         fc_period       = 256,
         route_period    = None,
         route_entries   = ROUTE_ENTRIES,
+        retry_timeout   = None,
         link_ready      = None,
     ):
         assert 0 <= node_id < 256 and ports >= 1
@@ -918,7 +1060,8 @@ class FabricNode(LiteXModule):
         )
         self.ports = fports = []
         for p in range(ports):
-            port = FabricPort(max_hops=max_hops, queue_depth=queue_depth, fc_period=fc_period, link_ready=link_ready[p])
+            port = FabricPort(max_hops=max_hops, queue_depth=queue_depth, fc_period=fc_period,
+                retry_timeout=retry_timeout, link_ready=link_ready[p])
             self.add_module(f"port{p}", port)
             fports.append(port)
             self.comb += requester.port_up[p].eq(port.up)
@@ -1046,7 +1189,7 @@ class FabricNode(LiteXModule):
         self.comb += [
             out_w0.eq(cur.w0),
             # Hop limit: decremented when forwarded.
-            If(~cur_injected, out_w0[16:24].eq(route_ttl(cur.w0) - 1)),
+            If(~cur_injected, out_w0[16:19].eq(route_ttl(cur.w0) - 1)),
         ]
         for p, port in enumerate(fports):
             self.comb += [
