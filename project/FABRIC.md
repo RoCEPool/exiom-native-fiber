@@ -236,5 +236,11 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
 `test/fabric_sim.py` runs the Migen simulator with a faster equivalent of its statement grouping
 (the original takes minutes to start on 8 nodes and more).
 
+Every push and pull request runs the tests that cover each feature at a small scale (2 and 4
+nodes, 8 nodes for forwarding over 3 links). The longest simulations (8 and 16 nodes with a node
+or a cable cut, networks with losses, wide links at scale, throughput of 4 nodes, more Verilator
+networks) are nightly tests (`test/nightly.py`): skipped by default, run every night and on
+demand by `.github/workflows/nightly.yml`, or locally with `EXIOM_NIGHTLY=1 python3 -m pytest -v`.
+
 Scope: simulation only. No FPGA synthesis, timing closure or hardware test. Links between more
 than two nodes are word-level (no PHY model).
