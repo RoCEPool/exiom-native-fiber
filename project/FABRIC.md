@@ -130,9 +130,13 @@ Counters per port: `retransmits`, `rx_discards`.
 
 ## Throughput
 
-- The switch moves one packet per cycle (the next input that has a packet, in turn); ports send
-  packets back to back; flow control packets are sent at once when the neighbor has no credit
-  left.
+- Switch: each group of inputs (the Responder, the Requester, each port) proposes one packet per
+  cycle, the next of its inputs that has a packet, in turn; each output (each port, the Requester,
+  the Responder) takes one of the packets proposed to it, in turn. Every port can receive a packet
+  and send a packet in the same cycle. The packets of an input keep their order, and a packet
+  that has to wait does not block the others.
+- Ports send packets back to back; flow control packets are sent at once when the neighbor has no
+  credit left.
 - The Requester takes a request per cycle; the Responder executes a request from the head of its
   buffer (a request every two cycles with a memory answering in one).
 - With links of 128 bits per cycle a packet takes one cycle on the link.
@@ -142,16 +146,16 @@ Requests per 1000 cycles, writes sent as fast as the nodes accept them, word-lev
 
 | Fabric | 32-bit links | 128-bit links |
 |--------|--------------|---------------|
-| 2 nodes, one way | 148 | 367 |
-| 2 nodes, both ways | 184 | 481 |
-| 4 nodes, 3 nodes to one | 221 | 317 |
-| 4 nodes, all to all | 707 | 753 |
-| 8 nodes (one cable between the groups), all to all | 275 | 563 |
-| 16 nodes, all to all | 1034 | 1333 |
+| 2 nodes, one way | 148 | 383 |
+| 2 nodes, both ways | 177 | 614 |
+| 4 nodes, 3 nodes to one | 426 | 490 |
+| 4 nodes, all to all | 889 | 1504 |
+| 8 nodes (one cable between the groups), all to all | 283 | 839 |
+| 16 nodes, all to all | 1022 | 3033 |
 
-With 128-bit links the bound is the switch: a node moves one packet per cycle, and a request
-served by a node is two packets there (the request in, the response out), so 500 requests per
-1000 cycles per node at most.
+Bounds now: a Responder executes a request every two cycles (500 requests per 1000 cycles per
+destination node, reached with 3 nodes writing one); a Requester has 8 requests in flight by
+default; with 8 nodes of a fabric cabled for 16, the single cable between the two groups.
 
 ## Semantics
 
@@ -201,7 +205,7 @@ have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
   requests can fail (see above).
 - At most 6 links on a path (12 classes per port, one flow control packet). Distances are 3-bit.
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
-- A node moves one packet per cycle between all its ports (see Throughput).
+- A Responder executes one request at a time, in two cycles (see Throughput).
 
 ## Verification
 
