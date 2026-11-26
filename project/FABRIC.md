@@ -69,7 +69,12 @@ Paths left with one node down (`test_one_node_down`):
 
 ## Packet
 
-32-bit words, 2 to 4 words.
+32-bit words, 2 to 4 words. The number of words follows from the kind of packet (write request:
+4, read request: 3, read response: 3, write response: 2); a port does not accept a packet that
+has another number of words.
+
+Links carry `link_width` bits per cycle: 32 (one word per cycle, the SerWB link), 64 or 128 (a
+whole packet per cycle).
 
 | Word | Content |
 |------|---------|
@@ -125,19 +130,28 @@ Counters per port: `retransmits`, `rx_discards`.
 
 ## Throughput
 
-The switch moves one packet per cycle (the next input that has a packet, in turn), ports send
-packets back to back, and flow control packets are sent at once when the neighbor has no credit
-left. Requests per 1000 cycles, writes sent as fast as the nodes accept them, word-level links
+- The switch moves one packet per cycle (the next input that has a packet, in turn); ports send
+  packets back to back; flow control packets are sent at once when the neighbor has no credit
+  left.
+- The Requester takes a request per cycle; the Responder executes a request from the head of its
+  buffer (a request every two cycles with a memory answering in one).
+- With links of 128 bits per cycle a packet takes one cycle on the link.
+
+Requests per 1000 cycles, writes sent as fast as the nodes accept them, word-level links
 (`test_throughput` keeps floors about 25 % below):
 
-| Fabric | Before | After |
-|--------|--------|-------|
-| 2 nodes, one way | 38 | 141 |
-| 2 nodes, both ways | 38 | 164 |
-| 4 nodes, 3 nodes to one | 38 | 187 |
-| 4 nodes, all to all | 112 | 516 |
-| 8 nodes (one cable between the groups), all to all | 81 | 256 |
-| 16 nodes, all to all | 239 | 883 |
+| Fabric | 32-bit links | 128-bit links |
+|--------|--------------|---------------|
+| 2 nodes, one way | 148 | 367 |
+| 2 nodes, both ways | 184 | 481 |
+| 4 nodes, 3 nodes to one | 221 | 317 |
+| 4 nodes, all to all | 707 | 753 |
+| 8 nodes (one cable between the groups), all to all | 275 | 563 |
+| 16 nodes, all to all | 1034 | 1333 |
+
+With 128-bit links the bound is the switch: a node moves one packet per cycle, and a request
+served by a node is two packets there (the request in, the response out), so 500 requests per
+1000 cycles per node at most.
 
 ## Semantics
 
@@ -187,8 +201,7 @@ have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
   requests can fail (see above).
 - At most 6 links on a path (12 classes per port, one flow control packet). Distances are 3-bit.
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
-- Throughput is bounded by the links, not by the switch: a link carries one 32-bit word per
-  cycle, and a write and its response are 6 words.
+- A node moves one packet per cycle between all its ports (see Throughput).
 
 ## Verification
 
@@ -200,7 +213,7 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
   with any one node down.
 - `test_fabric.py`: two nodes, connected directly and through SerWB (word-level PHY model):
-  requests in flight, queueing, both directions, errors isolated to their request, lost request,
+  requests in flight, queueing, both directions, errors isolated to their request,
   late response, link down (with a sweep of the moment the link is lost), backpressure with the
   smallest buffers, invalid packets, Wishbone. Packets lost: a request, a response, several in
   a row, flow control packets, and one packet out of 8 at random in both directions: everything
@@ -212,7 +225,7 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
   with the bit-level generic PHYs, and 4-node networks with one hardware sequencer per node.
 - `test_fabric_sim.py`: the same benches with Verilator (runs in CI): two nodes bit-level, and
-  networks of 4 and 8 nodes. The Verilator build of 16 nodes needs more memory than the CI runner
+  networks of 4 and 8 nodes (32-bit and 128-bit links, with and without losses). The Verilator build of 16 nodes needs more memory than the CI runner
   has since the routes were added; 16 nodes run with the Migen simulator.
 
 `test/fabric_sim.py` runs the Migen simulator with a faster equivalent of its statement grouping
