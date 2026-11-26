@@ -27,7 +27,8 @@ from litex.soc.interconnect import stream
 from liteiclink.serwb.core   import SERWBCore
 from liteiclink.serwb.packet import packet_description
 
-from exiom.fabric import *
+from exiom.fabric  import *
+from exiom.network import FabricLossyLink
 
 from test.test_serwb_link import LoopbackPHY, bus_access
 
@@ -71,18 +72,21 @@ class Memory(LiteXModule):
 # Packet Filter ------------------------------------------------------------------------------------
 
 class PacketFilter(LiteXModule):
-    """Drops the data packet (not flow control) of index `drop` of a packet stream."""
+    """Drops `count` packets of a packet stream from the one of index `drop`: data packets (packets
+    sent again included), or flow control packets (`flow_control`)."""
     def __init__(self, sink, source):
-        self.drop    = Signal(16, reset=2**16 - 1)
-        self.dropped = Signal(16)
+        self.drop         = Signal(16, reset=2**16 - 1)
+        self.count        = Signal(16, reset=1)
+        self.flow_control = Signal()
+        self.dropped      = Signal(16)
         first    = Signal(reset=1)
         index    = Signal(16)
-        data     = Signal()
+        counted  = Signal()
         dropping = Signal()
         drop_now = Signal()
         self.comb += [
-            data.eq(~sink.data[25]),
-            drop_now.eq(Mux(first, data & (index == self.drop), dropping)),
+            counted.eq(Mux(self.flow_control, sink.data[25], ~sink.data[25] & ~sink.data[26])),
+            drop_now.eq(Mux(first, counted & (index >= self.drop) & (index < (self.drop + self.count)), dropping)),
             sink.connect(source),
             If(drop_now,
                 source.valid.eq(0),
@@ -93,7 +97,7 @@ class PacketFilter(LiteXModule):
             If(sink.valid & sink.ready,
                 first.eq(sink.last),
                 dropping.eq(drop_now & ~sink.last),
-                If(first & data,
+                If(first & counted,
                     index.eq(index + 1),
                     If(drop_now, self.dropped.eq(self.dropped + 1)),
                 )
@@ -105,7 +109,7 @@ class PacketFilter(LiteXModule):
 class DUT(LiteXModule):
     """Nodes A (id 1) and B (id 2), each with its memory."""
     def __init__(self, link="direct", size=128, requests=8, request_timeout=4096, buffer_depth=4,
-        queue_depth=2, fc_period=64, read_only=False, memory_timeout=128, mem_kwargs={}):
+        queue_depth=2, fc_period=64, read_only=False, memory_timeout=128, loss=0, mem_kwargs={}):
         self.link_up = Signal(reset=1)
 
         # Nodes.
@@ -122,6 +126,13 @@ class DUT(LiteXModule):
         b_source = stream.Endpoint(packet_description(32))
         self.a2b = PacketFilter(self.a.source, a_source)
         self.b2a = PacketFilter(self.b.source, b_source)
+        if loss:
+            # Packets lost at random in both directions (`loss` out of 256).
+            a_lossy, b_lossy = a_source, b_source
+            a_source = stream.Endpoint(packet_description(32))
+            b_source = stream.Endpoint(packet_description(32))
+            self.a_lossy = FabricLossyLink(a_lossy, a_source, loss=loss, seed=1)
+            self.b_lossy = FabricLossyLink(b_lossy, b_source, loss=loss, seed=2)
 
         # Link.
         if link == "direct":
@@ -359,32 +370,85 @@ class TestFabric(unittest.TestCase):
             self.assertEqual((yield from read(dut.a, B, 2)), (0x1234, FABRIC_OK))
         run_simulation(dut, generator())
 
-    def lost_packet_test(self, direction):
-        # Third of 6 writes in flight lost (request or response): only this one fails.
-        dut = DUT(link="serwb", request_timeout=2000, mem_kwargs=dict(latency=8))
+    def lost_packet_test(self, direction, link="serwb", count=1, flow_control=False):
+        # Packets lost on the link while 6 writes are in flight: they are sent again, every write
+        # is executed once and acknowledged.
+        dut = DUT(link=link, request_timeout=4000, mem_kwargs=dict(latency=8))
         def generator():
-            yield {"request": dut.a2b, "response": dut.b2a}[direction].drop.eq(2)
+            lossy = {"request": dut.a2b, "response": dut.b2a}[direction]
+            yield lossy.flow_control.eq(int(flow_control))
+            yield lossy.count.eq(count)
+            yield lossy.drop.eq(2)
             tags = []
             for adr in range(6):
                 tags.append((yield from request(dut.a, adr, we=1, dat_w=pattern(adr), dst=B)))
             r = yield from results(dut.a, 6)
             for adr, tag in enumerate(tags):
-                self.assertEqual(r[tag][1], FABRIC_NO_RESPONSE if adr == 2 else FABRIC_OK)
-            # Lost request: not executed. Lost response: executed, but not confirmed.
-            self.assertEqual((yield dut.b_mem.mem[2]), 0 if direction == "request" else pattern(2))
-            for adr in [0, 1, 3, 4, 5]:
+                self.assertEqual(r[tag][1], FABRIC_OK)
+            for adr in range(6):
                 self.assertEqual((yield dut.b_mem.mem[adr]), pattern(adr))
-            # Following requests are fine.
-            self.assertEqual((yield from write(dut.a, B, 6, pattern(6))), FABRIC_OK)
-            self.assertEqual((yield from read(dut.a, B, 6)), (pattern(6), FABRIC_OK))
+            for adr in range(6, 12):
+                self.assertEqual((yield from write(dut.a, B, adr, pattern(adr))), FABRIC_OK)
+                self.assertEqual((yield from read(dut.a, B, adr)), (pattern(adr), FABRIC_OK))
+            yield from wait(600)
+            # Lost packets really dropped, nothing executed twice, nothing left over.
+            self.assertEqual((yield lossy.dropped), count)
+            self.assertEqual((yield dut.b.responder.requests), 6 + 12)
             self.assertEqual((yield dut.a.requester.stale), 0)
+            retransmits = 0
+            for node in [dut.a, dut.b]:
+                retransmits += (yield node.ports[0].retransmits)
+                self.assertEqual((yield node.ports[0].rx_drops), 0)
+                self.assertEqual((yield node.ports[0].resyncs), 0)
+            if not flow_control:
+                self.assertGreater(retransmits, 0)
         run_simulation(dut, generator())
 
     def test_lost_request(self):
-        self.lost_packet_test("request")
+        for link in self.links():
+            with self.subTest(link=link):
+                self.lost_packet_test("request", link=link)
 
     def test_lost_response(self):
-        self.lost_packet_test("response")
+        for link in self.links():
+            with self.subTest(link=link):
+                self.lost_packet_test("response", link=link)
+
+    def test_lost_several(self):
+        # Three packets in a row, so also the packets sent again.
+        self.lost_packet_test("request",  link="direct", count=3)
+        self.lost_packet_test("response", link="direct", count=3)
+
+    def test_lost_flow_control(self):
+        # Acknowledgments and credits lost: sent again with the next flow control packets, packets
+        # sent again meanwhile are recognized and discarded.
+        self.lost_packet_test("response", link="direct", count=4, flow_control=True)
+        self.lost_packet_test("request",  link="direct", count=4, flow_control=True)
+
+    def test_lossy_link(self):
+        # One packet out of 8 lost at random in both directions (data, flow control): everything
+        # is executed once and in order.
+        for link in self.links():
+            with self.subTest(link=link):
+                dut = DUT(link=link, loss=32, request_timeout=30000, mem_kwargs=dict(latency=4))
+                n = 120
+                def sender():
+                    for i in range(n):
+                        # Same word written again and again: the last write must be the last executed.
+                        yield from request(dut.a, i % 8, we=1, dat_w=pattern(i % 8, i // 8), dst=B)
+                def receiver():
+                    statuses = []
+                    for _ in range(n // 8):
+                        r = yield from results(dut.a, 8)
+                        statuses += [status for _, status, _ in r.values()]
+                    self.assertEqual(statuses, [FABRIC_OK]*n)
+                    for adr in range(8):
+                        self.assertEqual((yield dut.b_mem.mem[adr]), pattern(adr, n // 8 - 1))
+                    self.assertEqual((yield dut.b.responder.requests), n)
+                    self.assertGreater((yield dut.a_lossy.dropped), 5)
+                    self.assertGreater((yield dut.b_lossy.dropped), 5)
+                    self.assertEqual((yield dut.a.requester.stale), 0)
+                run_simulation(dut, [sender(), receiver()])
 
     def test_late_response(self):
         # Response arriving after the timeout of its request, when its slot is used by another
@@ -485,20 +549,18 @@ class TestFabric(unittest.TestCase):
                         self.assertEqual((yield node.ports[0].resyncs), 0)
                 run_simulation(dut, [sender(), receiver()])
 
-    def test_credit_recovery(self):
-        # A packet lost on the link is counted as sent and never received: with a single place per
-        # class the sender has no credit left, and gets it back after a while without sending.
-        dut = DUT(queue_depth=1, request_timeout=2000)
+    def test_single_place_queues(self):
+        # A single place per class and a packet lost: sent again when the neighbor asks or after
+        # the timeout, credits are not lost.
+        dut = DUT(queue_depth=1, request_timeout=4000)
         def generator():
             yield dut.a2b.drop.eq(1)
-            self.assertEqual((yield from write(dut.a, B, 0, pattern(0))), FABRIC_OK)
-            self.assertEqual((yield from write(dut.a, B, 1, pattern(1))), FABRIC_NO_RESPONSE)
-            self.assertEqual((yield dut.a.ports[0].resyncs), 1)
-            for adr in range(2, 6):
+            for adr in range(6):
                 self.assertEqual((yield from write(dut.a, B, adr, pattern(adr))), FABRIC_OK)
-            self.assertEqual((yield dut.b_mem.mem[1]), 0)
-            self.assertEqual((yield dut.a.ports[0].resyncs), 1)
+            self.assertEqual((yield dut.a.ports[0].retransmits), 1)
+            self.assertEqual((yield dut.a.ports[0].resyncs), 0)
             self.assertEqual((yield dut.b.ports[0].rx_drops), 0)
+            self.assertEqual((yield dut.b.responder.requests), 6)
         run_simulation(dut, generator())
 
     def test_invalid_packets(self):
@@ -514,26 +576,35 @@ class TestFabric(unittest.TestCase):
             yield
         def generator():
             route = (0xe << 28) | (1 << 16) | (A << 8) | B
+            def seq(n):
+                return n << 19 # Sequence number on the link.
             yield from send([0x12345678, 0x1, 0x2])                   # Invalid magic.
             yield from send([route])                                  # Route word only.
             yield from send([route & ~(0xff << 16), 0xf14, 4])        # Hop limit 0.
             yield from send([route | (2 << 16), 0xf14, 4])            # Hop limit above max_hops.
             yield from send([route, (1 << 12) | (0xf << 8) | 0x12, 4, 0xdead, 0xbeef, 0xcafe]) # Too long.
-            yield from send([route, (1 << 12) | (0xf << 8) | 0x11])   # Write without address.
+            yield from send([route | seq(0), (1 << 12) | (0xf << 8) | 0x11]) # Write without address.
             yield from wait(64)
             self.assertEqual((yield dut.b.ports[0].rx_invalid), 5)
             self.assertEqual((yield dut.b.responder.malformed), 1)
             self.assertEqual((yield dut.b.responder.requests), 0)
             self.assertEqual((yield dut.b_mem.mem[4]), 0)
             # Valid write then read still served.
-            yield from send([route, (1 << 12) | (0xf << 8) | 0x13, 4, 0x4444])
-            yield from send([route, (0xf << 8) | 0x14, 4])
+            # Not the sequence number expected, and a write whose data would be seen.
+            yield from send([route | seq(4), (1 << 12) | (0xf << 8) | 0x15, 5, 0x5555])
+            # Valid write then read still served.
+            yield from send([route | seq(1), (1 << 12) | (0xf << 8) | 0x13, 4, 0x4444])
+            yield from send([route | seq(2), (0xf << 8) | 0x14, 4])
+            yield from send([route | seq(1), (1 << 12) | (0xf << 8) | 0x13, 4, 0x9999]) # Sent again: discarded.
             yield from wait(64)
             self.assertEqual((yield dut.b_mem.mem[4]), 0x4444)
+            self.assertEqual((yield dut.b_mem.mem[5]), 0)
             self.assertEqual((yield dut.b.responder.requests), 2)
-            self.assertEqual(dut.responses, [
-                [(0xe << 28) | (1 << 24) | (1 << 16) | (B << 8) | A, (1 << 12) | 0x13],
-                [(0xe << 28) | (1 << 24) | (1 << 16) | (B << 8) | A, 0x14, 0x4444],
+            self.assertEqual((yield dut.b.ports[0].rx_discards), 2)
+            # Responses numbered 0 and 1 (and sent again later: nothing acknowledges them here).
+            self.assertEqual(dut.responses[:2], [
+                [(0xe << 28) | (1 << 24) | seq(0) | (1 << 16) | (B << 8) | A, (1 << 12) | 0x13],
+                [(0xe << 28) | (1 << 24) | seq(1) | (1 << 16) | (B << 8) | A, 0x14, 0x4444],
             ])
         run_simulation(dut, [generator(), passive(dut.monitor)()])
 
@@ -572,7 +643,7 @@ class DUTInject(LiteXModule):
             if (yield self.b.source.valid):
                 packet.append((yield self.b.source.data))
                 if (yield self.b.source.last):
-                    if not (packet[0] & (1 << 25)): # Flow control packets not recorded.
+                    if not (packet[0] & (3 << 25)): # Flow control and route packets not recorded.
                         self.responses.append(packet)
                     packet = []
             yield
