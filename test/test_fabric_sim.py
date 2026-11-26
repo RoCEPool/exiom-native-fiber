@@ -24,6 +24,8 @@ import unittest
 import tempfile
 import subprocess
 
+from test.nightly import nightly
+
 SIM = os.path.join(os.path.dirname(__file__), "..", "bench", "fabric", "sim.py")
 
 CONFIGS = {
@@ -33,11 +35,14 @@ CONFIGS = {
     "flow_control"         : ["--with-flow-control", "--sram-latency", "16"],
     # Networks, word-level links (two-tier topology cabled for 16 nodes).
     "4_nodes"              : ["--nodes", "4"],
+    "4_nodes_wide_lossy"   : ["--nodes", "4", "--link-width", "128", "--loss", "26", "--scenarios", "all,hotspot,errors"],
+}
+
+NIGHTLY_CONFIGS = {
     "4_nodes_small_buffers": ["--nodes", "4", "--queue-depth", "1", "--sram-latency", "20"],
     "4_nodes_hypercube"    : ["--nodes", "4", "--topology", "hypercube"],
     "4_nodes_lossy"        : ["--nodes", "4", "--loss", "26", "--scenarios", "all,hotspot,errors"],
     "4_nodes_wide"         : ["--nodes", "4", "--link-width", "128"],
-    "4_nodes_wide_lossy"   : ["--nodes", "4", "--link-width", "128", "--loss", "26", "--scenarios", "all,hotspot,errors"],
     # 8 and 16 nodes: with the Migen simulator (test_fabric_network.py, test_fabric_bench.py);
     # their Verilator build needs more memory than the CI runner has (./bench/fabric/sim.py
     # --nodes 8 on a larger machine).
@@ -57,11 +62,18 @@ class TestFabricSim(unittest.TestCase):
         results = [l for l in p.stdout.splitlines() if "FABRIC TEST" in l]
         return results[0] if results else p.stdout[-2000:]
 
-    def test_sim(self):
-        for name, args in CONFIGS.items():
+    def run_configs(self, configs):
+        for name, args in configs.items():
             with self.subTest(config=name):
                 result = self.run_sim(args)
                 self.assertIn("FABRIC TEST: PASS", result, f"{name}: {result}")
+
+    def test_sim(self):
+        self.run_configs(CONFIGS)
+
+    @nightly
+    def test_sim_nightly(self):
+        self.run_configs(NIGHTLY_CONFIGS)
 
 if __name__ == "__main__":
     unittest.main()

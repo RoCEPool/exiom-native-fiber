@@ -10,7 +10,8 @@
 Fabric networks (exiom/network.py): several nodes, forwarding over several links, credits.
 
 Word-level links. 4 nodes (one group, all connected), 8 nodes (two groups) and 16 nodes (four
-groups, up to 3 links between two nodes, 5 around a node that is down).
+groups, up to 3 links between two nodes, 5 around a node that is down). The longest ones are
+nightly tests (test/nightly.py).
 """
 
 import random
@@ -26,6 +27,7 @@ from exiom.topology import *
 from exiom.network  import *
 
 from test.test_fabric import Memory, request, result, results, write, read, wait
+from test.nightly     import nightly
 
 # After the other imports (run_simulation is also exported by litex.gen).
 from test.fabric_sim import run_simulation # Same simulator, starts faster on large designs.
@@ -295,8 +297,8 @@ class TestFabricNetwork(unittest.TestCase):
             all_to_all(self, dut, salt=1, check_hops=False),
         ])
 
-    def test_wide_links(self):
-        # 128 bits per cycle (a whole packet), with and without losses, up to 16 nodes.
+    def test_4_nodes_wide(self):
+        # 128 bits per cycle on the links (a whole packet).
         dut = DUT(two_tier(4), link_width=128)
         run(dut, [
             all_to_all(self, dut, check_hops=False),
@@ -304,6 +306,10 @@ class TestFabricNetwork(unittest.TestCase):
             hotspot(self, dut),
             node_down(self, dut, down=2),
         ])
+
+    @nightly
+    def test_wide_links(self):
+        # 128 and 64 bits per cycle at scale: 8 nodes with losses, 16 nodes.
         dut = DUT(two_tier(8), link_width=128, loss=26, buffer_depth=2, queue_depth=1, request_timeout=60000)
         self.lossy(dut, [
             all_to_all(self, dut),
@@ -316,24 +322,30 @@ class TestFabricNetwork(unittest.TestCase):
             random_traffic(self, dut, requests=8),
         ])
 
+    # Requests per 1000 cycles (floors about 25 % under the rates measured), with links of 32 bits
+    # per cycle and of 128 bits per cycle (a whole packet): [2 nodes one way, 2 nodes both ways,
+    # 4 nodes 3 to one, 4 nodes all to all].
+    throughput_floors = {32: [110, 130, 320, 665], 128: [285, 460, 365, 1125]}
+
     def test_throughput(self):
-        # Requests per 1000 cycles (floors about 25 % under the rates measured), with links of 32
-        # bits per cycle and of 128 bits per cycle (a whole packet).
-        one       = lambda src, prng: 1
-        other     = lambda src, prng: 1 - src
-        zero      = lambda src, prng: 0
-        any_other = lambda src, prng: (src + 1 + prng.randrange(3)) % 4
-        for link_width, floors in [(32, [110, 130, 320, 665]), (128, [285, 460, 365, 1125])]:
+        # Two nodes.
+        for link_width, floors in self.throughput_floors.items():
             with self.subTest(link_width=link_width):
                 dut = DUT(two_tier(2), link_width=link_width)
                 run(dut, [
-                    flood(self, dut, [0],    one,   200, floor=floors[0]),
-                    flood(self, dut, [0, 1], other, 200, floor=floors[1]),
+                    flood(self, dut, [0],    lambda src, prng: 1,       200, floor=floors[0]),
+                    flood(self, dut, [0, 1], lambda src, prng: 1 - src, 200, floor=floors[1]),
                 ])
+
+    @nightly
+    def test_throughput_4_nodes(self):
+        any_other = lambda src, prng: (src + 1 + prng.randrange(3)) % 4
+        for link_width, floors in self.throughput_floors.items():
+            with self.subTest(link_width=link_width):
                 dut = DUT(two_tier(4), link_width=link_width)
                 run(dut, [
-                    flood(self, dut, [1, 2, 3],    zero,      100, floor=floors[2]), # One destination.
-                    flood(self, dut, [0, 1, 2, 3], any_other, 100, floor=floors[3]),
+                    flood(self, dut, [1, 2, 3],    lambda src, prng: 0, 100, floor=floors[2]), # One destination.
+                    flood(self, dut, [0, 1, 2, 3], any_other,           100, floor=floors[3]),
                 ])
 
     def test_4_nodes_backpressure(self):
@@ -367,6 +379,7 @@ class TestFabricNetwork(unittest.TestCase):
             hotspot(self, dut),
         ])
 
+    @nightly
     def test_8_nodes_lossy(self):
         # Packets forwarded over up to 3 lossy links, smallest buffers.
         dut = DUT(two_tier(8), loss=26, buffer_depth=2, queue_depth=1, request_timeout=60000)
@@ -387,6 +400,13 @@ class TestFabricNetwork(unittest.TestCase):
             link_down(self, dut, link=(0, 0)),
         ])
 
+    def test_8_nodes_forwarding(self):
+        # Two groups of 4: requests and responses forwarded over up to 3 links.
+        dut = DUT(two_tier(8))
+        self.assertEqual((dut.net.diameter, dut.net.max_hops), (3, 5))
+        run(dut, [all_to_all(self, dut)])
+
+    @nightly
     def test_8_nodes(self):
         # Two groups of 4 of a fabric cabled for 16 nodes: one cable between the groups, up to 3
         # links. Without the node that has this cable, the other group cannot be reached.
@@ -401,6 +421,7 @@ class TestFabricNetwork(unittest.TestCase):
             all_to_all(self, dut, salt=1),
         ])
 
+    @nightly
     def test_8_nodes_two_groups(self):
         # Fabric cabled for 8 nodes: 4 cables between the two groups. Any node or cable can go,
         # the others are still served. Route packets in several parts (4 destinations each).
@@ -414,6 +435,7 @@ class TestFabricNetwork(unittest.TestCase):
             all_to_all(self, dut, salt=1),
         ])
 
+    @nightly
     def test_16_nodes(self):
         # Four groups of 4, one cable between each pair of groups, 4 ports per node.
         dut = DUT(two_tier(16))
