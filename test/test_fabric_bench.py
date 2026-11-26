@@ -130,8 +130,8 @@ class TestFabricBench(unittest.TestCase):
                 self.assertEqual(results["failed"], (sim.NODE_A, 1))
 
 class TestFabricNetworkBench(unittest.TestCase):
-    """Network bench (word-level links, one sequencer per node). 4 nodes here; 8 and 16 nodes with
-    Verilator (test/test_fabric_sim.py)."""
+    """Network bench (word-level links, one sequencer per node), 4 and 8 nodes. The same bench runs
+    with Verilator for 4 nodes (test/test_fabric_sim.py)."""
     def run_bench(self, **kwargs):
         sim     = load_sim()
         dut     = sim.FabricNetworkBench(timeout=400000, **kwargs)
@@ -174,6 +174,12 @@ class TestFabricNetworkBench(unittest.TestCase):
 
     def test_4_nodes_small_buffers(self):
         self.run_bench(nodes=4, sram_latency=20, queue_depth=1, buffer_depth=2)
+
+    def test_8_nodes(self):
+        # Two groups, up to 3 links, the node with the cable between the groups cut and back.
+        sim, dut, results = self.run_bench(nodes=8, sram_latency=8)
+        self.assertEqual(results["was_down"], 1)
+        self.assertGreater(results["forwarded"], 0)
 
     def test_4_nodes_lossy(self):
         # One packet out of 10 lost on every link: sent again, every request served once.
