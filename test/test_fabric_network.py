@@ -44,13 +44,12 @@ class DUT(LiteXModule):
         self.nodes = self.net.nodes
 
     def check_no_drop(self, test):
-        """No packet dropped for lack of room, no credit lost, no response without request."""
+        """No packet refused for lack of room, no response without request."""
         for node in self.nodes:
             test.assertEqual((yield node.requester.stale), 0)
             test.assertEqual((yield node.rsp_drops), 0)
             for port in node.ports:
                 test.assertEqual((yield port.rx_drops), 0)
-                test.assertEqual((yield port.resyncs), 0)
 
 def value(src, dst, salt=0):
     return (0xa5000000 | (salt << 20) | (src << 8) | dst) & 0xffffffff
@@ -324,7 +323,7 @@ class TestFabricNetwork(unittest.TestCase):
         other     = lambda src, prng: 1 - src
         zero      = lambda src, prng: 0
         any_other = lambda src, prng: (src + 1 + prng.randrange(3)) % 4
-        for link_width, floors in [(32, [110, 135, 165, 530]), (128, [275, 360, 235, 565])]:
+        for link_width, floors in [(32, [110, 130, 320, 665]), (128, [285, 460, 365, 1125])]:
             with self.subTest(link_width=link_width):
                 dut = DUT(two_tier(2), link_width=link_width)
                 run(dut, [

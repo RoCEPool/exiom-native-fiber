@@ -640,7 +640,6 @@ class FabricPort(LiteXModule):
         self.rx_invalid = rx_invalid = Signal(32) # Packets dropped (not a fabric packet, malformed).
         self.rx_drops   = rx_drops   = Signal(32) # Packets dropped (queue full: credits not respected).
         self.tx_drops   = tx_drops   = Signal(32) # Packets dropped (link down).
-        self.resyncs    = resyncs    = Signal(32) # Credits recovered (packets never delivered).
         self.retransmits = retransmits = Signal(32) # Times packets were sent again.
         self.rx_discards = rx_discards = Signal(32) # Packets discarded (not the one expected).
 
@@ -794,54 +793,35 @@ class FabricPort(LiteXModule):
             )
         ]
 
-        # TX: Sender side of the credits (S: packets sent, R/L: last values from the neighbor).
-        # --------------------------------------------------------------------------------------
+        # TX: Sender side of the credits (S: packets sent, L: last value from the neighbor).
+        # -----------------------------------------------------------------------------------
         tx_s     = [Signal(4, name=f"tx_s{c}") for c in range(classes)]
-        tx_r     = [Signal(4, name=f"tx_r{c}") for c in range(classes)]
         tx_l     = [Signal(4, reset=queue_depth, name=f"tx_l{c}") for c in range(classes)]
-        tx_idle  = [Signal(max=4*fc_period + 1, name=f"tx_idle{c}") for c in range(classes)]
         fc_ok    = Signal() # Flow control packet received.
         sent     = Signal()
-        resynced = []
         self.comb += [
             sent.eq(tx.valid & tx.ready & up),
             fc_ok.eq(rx_fc),
         ]
         for c in range(classes):
-            room   = Signal(4, name=f"tx_room{c}")
-            resync = Signal(name=f"tx_resync{c}")
-            resynced.append(resync)
+            room = Signal(4, name=f"tx_room{c}")
             # Flow control word: classes 4n to 4n+3, {L, R} each.
             fc_word = [rx.w1, rx.w2, rx.w3][c//4]
-            fc_r    = fc_word[8*(c % 4) + 0:8*(c % 4) + 4]
             fc_l    = fc_word[8*(c % 4) + 4:8*(c % 4) + 8]
             self.comb += [
                 room.eq(tx_l[c] - tx_s[c]),
                 credit[c].eq((room != 0) & (room <= queue_depth)),
-                # Nothing sent for a long time: packets sent and not received will never be.
-                resync.eq((tx_idle[c] == 4*fc_period) & (tx_s[c] != tx_r[c]) & ~(sent & (self.tx_class == c))),
             ]
+            # Packets are sent again until they are received: a packet sent is never lost while
+            # the link is up, and the packets sent (S) need no correction.
             self.sync += [
-                If(sent & (self.tx_class == c),
-                    tx_s[c].eq(tx_s[c] + 1),
-                    tx_idle[c].eq(0),
-                ).Elif(tx_idle[c] != 4*fc_period,
-                    tx_idle[c].eq(tx_idle[c] + 1)
-                ).Elif(resync,
-                    tx_s[c].eq(tx_r[c]),
-                ),
-                If(fc_ok,
-                    tx_r[c].eq(fc_r),
-                    tx_l[c].eq(fc_l),
-                ),
+                If(sent & (self.tx_class == c), tx_s[c].eq(tx_s[c] + 1)),
+                If(fc_ok, tx_l[c].eq(fc_l)),
                 If(~up,
                     tx_s[c].eq(0),
-                    tx_r[c].eq(0),
                     tx_l[c].eq(queue_depth),
-                    tx_idle[c].eq(0),
                 )
             ]
-        self.sync += If((Cat(*resynced) != 0) & up, If(resyncs != (2**32 - 1), resyncs.eq(resyncs + 1)))
 
         # TX: Packets sent, kept until acknowledged.
         # -------------------------------------------
@@ -1121,125 +1101,184 @@ class FabricNode(LiteXModule):
         # Switch.
         # -------
         # Inputs: packets injected by this node (Responder, Requester) and the queues of the ports.
-        # Each cycle, the next input that has a packet (in turn) is looked at; its packet moves
-        # when its output can take it, so a packet that has to wait never blocks the packets of
-        # the other inputs, and one packet moves per cycle when there are packets to move.
-        inputs = [] # (endpoint, port it came from (None: injected), links crossed).
-        inputs.append((responder.tx, None, 0))
-        inputs.append((requester.tx, None, 0))
-        for p, port in enumerate(fports):
-            for c, queue in enumerate(port.queues):
-                inputs.append((queue, p, (c % max_hops) + 1))
-        count   = len(inputs)
-        sel     = Signal(max=count)
-        turn    = Signal(max=count) # First input looked at in this cycle.
-        valids  = Signal(count)
-        ahead   = Signal(count)     # Inputs with a packet, from `turn`.
-        self.encoder_ahead = encoder_ahead = PriorityEncoder(count)
-        self.encoder_all   = encoder_all   = PriorityEncoder(count)
-        self.comb += [
-            valids.eq(Cat(*[endpoint.valid for endpoint, _, _ in inputs])),
-            ahead.eq(valids & ~((1 << turn) - 1)),
-            encoder_ahead.i.eq(ahead),
-            encoder_all.i.eq(valids),
-            sel.eq(Mux(encoder_ahead.n, encoder_all.o, encoder_ahead.o)),
-        ]
-        self.sync += If(valids != 0, If(sel == (count - 1), turn.eq(0)).Else(turn.eq(sel + 1)))
-
-        # Selected input.
-        cur          = stream.Endpoint(fabric_packet_layout())
-        cur_injected = Signal()
-        cur_port     = Signal(port_bits)
-        cur_crossed  = Signal(max=max_hops + 1)
-        cases = {}
-        for i, (endpoint, from_port, crossed) in enumerate(inputs):
-            cases[i] = [
-                endpoint.connect(cur),
-                cur_injected.eq(int(from_port is None)),
-                cur_port.eq(0 if from_port is None else from_port),
-                cur_crossed.eq(crossed),
-            ]
-        self.comb += Case(sel, cases)
-
-        # Route.
-        dst         = Signal(8)
-        rsp         = Signal()
-        local       = Signal()
-        route_valid = Signal()
-        route_port  = Signal(port_bits)
-        budget      = Signal(3)
-        any_up      = Signal()
-        forward     = Signal()
-        out_class   = Signal(max=classes)
-        out_ready   = Signal()
-        out_credit  = Signal()
-        self.comb += [
-            dst.eq(route_dst(cur.w0)),
-            rsp.eq(route_rsp(cur.w0)),
-            local.eq(dst == node_id),
-            budget.eq(max_hops - cur_crossed),
-            *table.select(dst,
-                exclude      = ~cur_injected,
-                exclude_port = cur_port,
-                budget       = budget,
-                valid        = route_valid,
-                port         = route_port,
-            ),
-            any_up.eq(Cat(*[port.up for port in fports]) != 0),
-            out_class.eq(Mux(rsp, max_hops, 0) + cur_crossed),
-            out_ready.eq(Array([port.tx.ready for port in fports])[route_port]),
-            out_credit.eq((Array([port.credit for port in fports])[route_port] >> out_class)[0]),
-            # A packet goes on when a port can take it towards its destination.
-            forward.eq(~local & route_valid),
-        ]
-
-        # Destination of the selected packet.
-        to_requester = Signal()
-        to_responder = Signal()
-        to_port      = Signal()
-        to_drop      = Signal()
-        to_discard   = Signal()
-        self.comb += [
-            If(cur.valid,
-                If(forward,
-                    to_port.eq(out_ready & out_credit)
-                ).Elif(rsp,
-                    # Response for this node, or that cannot go further (dropped).
-                    to_requester.eq(local),
-                    to_drop.eq(~local),
-                ).Elif(cur_injected & ~local & ~any_up,
-                    # Request of this node whose last link went down while it waited: its
-                    # Requester already ended it with FABRIC_LINK.
-                    to_discard.eq(1)
-                ).Else(
-                    # Request for this node, or request of another node that cannot go further
-                    # (answered with FABRIC_NODE).
-                    to_responder.eq(responder.rx.ready)
-                )
-            ),
-            cur.ready.eq(to_port | to_requester | to_responder | to_drop | to_discard),
-            cur.connect(requester.rx, omit={"valid", "ready"}),
-            cur.connect(responder.rx, omit={"valid", "ready"}),
-            requester.rx.valid.eq(to_requester),
-            responder.rx.valid.eq(to_responder),
-        ]
-        out_w0 = Signal(32)
-        self.comb += [
-            out_w0.eq(cur.w0),
-            # Hop limit: decremented when forwarded.
-            If(~cur_injected, out_w0[16:19].eq(route_ttl(cur.w0) - 1)),
-        ]
-        for p, port in enumerate(fports):
+        # Outputs: the ports, the Requester (responses) and the Responder (requests).
+        #
+        # Each group of inputs (the Responder, the Requester, each port) proposes one packet per
+        # cycle: the next of its inputs that has a packet, in turn. Each output takes one of the
+        # packets proposed to it, in turn. So every port can receive a packet and send a packet in
+        # the same cycle, a packet that has to wait never blocks the packets of the other inputs,
+        # and the packets of an input keep their order.
+        def in_turn(requests, name):
+            """Index of the next request set from a turn that follows the last one served, and
+            statements moving the turn."""
+            count = len(requests)
+            sel   = Signal(max=max(2, count), name=f"{name}_sel")
+            some  = Signal(name=f"{name}_some")
+            if count == 1:
+                self.comb += [sel.eq(0), some.eq(requests[0])]
+                return sel, some, lambda served: []
+            turn  = Signal(max=count, name=f"{name}_turn")
+            vec   = Signal(count,     name=f"{name}_requests")
+            ahead = PriorityEncoder(count)
+            every = PriorityEncoder(count)
+            self.submodules += ahead, every
             self.comb += [
-                cur.connect(port.tx, omit={"valid", "ready", "w0"}),
-                port.tx.w0.eq(out_w0),
-                port.tx.valid.eq(to_port & (route_port == p)),
-                port.tx_class.eq(out_class),
+                vec.eq(Cat(*requests)),
+                ahead.i.eq(vec & ~((1 << turn) - 1)),
+                every.i.eq(vec),
+                sel.eq(Mux(ahead.n, every.o, ahead.o)),
+                some.eq(vec != 0),
             ]
+            return sel, some, lambda served: [If(served, If(sel == (count - 1), turn.eq(0)).Else(turn.eq(sel + 1)))]
+
+        groups = [] # Inputs: (endpoint, port it came from (None: injected), links crossed).
+        groups.append([(responder.tx, None, 0)])
+        groups.append([(requester.tx, None, 0)])
+        for p, port in enumerate(fports):
+            groups.append([(queue, p, (c % max_hops) + 1) for c, queue in enumerate(port.queues)])
+
+        any_up = Signal()
+        self.comb += any_up.eq(Cat(*[port.up for port in fports]) != 0)
+
+        # Packet proposed by each group, and the output it asks for.
+        proposals = [] # Per group: (packet, word 0 to send, class to send in).
+        to_ports      = [[] for _ in fports] # Per port: request of each group.
+        to_requesters = []
+        to_responders = []
+        granted       = []
+        frees         = []
+        for g, inputs in enumerate(groups):
+            sel, some, move = in_turn([endpoint.valid for endpoint, _, _ in inputs], f"group{g}")
+            # The turn moves on at each cycle with a packet: a packet that cannot leave lets the
+            # next input of the group propose its own.
+            self.sync += move(some)
+
+            cur          = stream.Endpoint(fabric_packet_layout())
+            cur_injected = Signal(name=f"group{g}_injected")
+            cur_port     = Signal(port_bits, name=f"group{g}_port")
+            cur_crossed  = Signal(max=max_hops + 1, name=f"group{g}_crossed")
+            cases = {}
+            for i, (endpoint, from_port, crossed) in enumerate(inputs):
+                cases[i] = [
+                    endpoint.connect(cur),
+                    cur_injected.eq(int(from_port is None)),
+                    cur_port.eq(0 if from_port is None else from_port),
+                    cur_crossed.eq(crossed),
+                ]
+            self.comb += Case(sel, cases)
+
+            # Route.
+            dst         = Signal(8, name=f"group{g}_dst")
+            rsp         = Signal(name=f"group{g}_rsp")
+            local       = Signal(name=f"group{g}_local")
+            route_valid = Signal(name=f"group{g}_route_valid")
+            route_port  = Signal(port_bits, name=f"group{g}_route_port")
+            budget      = Signal(3, name=f"group{g}_budget")
+            forward     = Signal(name=f"group{g}_forward")
+            out_class   = Signal(max=classes, name=f"group{g}_class")
+            out_ready   = Signal(name=f"group{g}_out_ready")
+            out_credit  = Signal(name=f"group{g}_out_credit")
+            out_w0      = Signal(32, name=f"group{g}_w0")
+            self.comb += [
+                dst.eq(route_dst(cur.w0)),
+                rsp.eq(route_rsp(cur.w0)),
+                local.eq(dst == node_id),
+                budget.eq(max_hops - cur_crossed),
+                *table.select(dst,
+                    exclude      = ~cur_injected,
+                    exclude_port = cur_port,
+                    budget       = budget,
+                    valid        = route_valid,
+                    port         = route_port,
+                ),
+                out_class.eq(Mux(rsp, max_hops, 0) + cur_crossed),
+                out_ready.eq(Array([port.tx.ready for port in fports])[route_port]),
+                out_credit.eq((Array([port.credit for port in fports])[route_port] >> out_class)[0]),
+                # A packet goes on when a port can take it towards its destination.
+                forward.eq(~local & route_valid),
+                out_w0.eq(cur.w0),
+                # Hop limit: decremented when forwarded.
+                If(~cur_injected, out_w0[16:19].eq(route_ttl(cur.w0) - 1)),
+            ]
+
+            # Output asked.
+            to_port      = Signal(name=f"group{g}_to_port")
+            to_requester = Signal(name=f"group{g}_to_requester")
+            to_responder = Signal(name=f"group{g}_to_responder")
+            to_drop      = Signal(name=f"group{g}_to_drop")
+            to_discard   = Signal(name=f"group{g}_to_discard")
+            grant        = Signal(name=f"group{g}_grant")
+            self.comb += [
+                If(cur.valid,
+                    If(forward,
+                        to_port.eq(out_ready & out_credit)
+                    ).Elif(rsp,
+                        # Response for this node, or that cannot go further (dropped).
+                        to_requester.eq(local),
+                        to_drop.eq(~local),
+                    ).Elif(cur_injected & ~local & ~any_up,
+                        # Request of this node whose last link went down while it waited: its
+                        # Requester already ended it with FABRIC_LINK.
+                        to_discard.eq(1)
+                    ).Else(
+                        # Request for this node, or request of another node that cannot go further
+                        # (answered with FABRIC_NODE).
+                        to_responder.eq(responder.rx.ready)
+                    )
+                ),
+                cur.ready.eq(grant | to_drop | to_discard),
+            ]
+            for p in range(ports):
+                request = Signal(name=f"group{g}_to_port{p}")
+                self.comb += request.eq(to_port & (route_port == p))
+                to_ports[p].append(request)
+            to_requesters.append(to_requester)
+            to_responders.append(to_responder)
+            proposals.append((cur, out_w0, out_class))
+            granted.append(grant)
+            frees.append((to_drop, cur_injected, local))
+
+        # Packet taken by each output.
+        grants = [[] for _ in groups] # Per group: grant of each output.
+        def output(requests, name):
+            sel, some, move = in_turn(requests, name)
+            self.sync += move(some)
+            for g in range(len(groups)):
+                grants[g].append(some & (sel == g))
+            return sel, some
+
+        for p, port in enumerate(fports):
+            sel, some = output(to_ports[p], f"port{p}_tx")
+            self.comb += [
+                port.tx.valid.eq(some),
+                Case(sel, {g: [
+                    cur.connect(port.tx, omit={"valid", "ready", "w0"}),
+                    port.tx.w0.eq(out_w0),
+                    port.tx_class.eq(out_class),
+                ] for g, (cur, out_w0, out_class) in enumerate(proposals)}),
+            ]
+        sel, some = output(to_requesters, "requester_rx")
+        self.comb += [
+            requester.rx.valid.eq(some),
+            Case(sel, {g: cur.connect(requester.rx, omit={"valid", "ready"}) for g, (cur, _, _) in enumerate(proposals)}),
+        ]
+        sel, some = output(to_responders, "responder_rx")
+        self.comb += [
+            responder.rx.valid.eq(some),
+            Case(sel, {g: cur.connect(responder.rx, omit={"valid", "ready"}) for g, (cur, _, _) in enumerate(proposals)}),
+        ]
+        for g in range(len(groups)):
+            self.comb += granted[g].eq(Cat(*grants[g]) != 0)
+
+        # Counters (several packets can move in a cycle).
+        def count(bits):
+            return sum(Cat(bit, Constant(0, 3)) for bit in bits)
+        port_grants      = [Cat(*grants[g][:ports]) != 0 for g in range(len(groups))]
+        responder_grants = [grants[g][ports + 1] for g in range(len(groups))]
         self.sync += [
-            If(to_port & ~cur_injected, forwarded.eq(forwarded + 1)),
-            If(to_responder & ~local,   unreachable.eq(unreachable + 1)),
-            If(to_drop,                 rsp_drops.eq(rsp_drops + 1)),
+            forwarded.eq(forwarded + count([port_grants[g] & ~frees[g][1] for g in range(len(groups))])),
+            unreachable.eq(unreachable + count([responder_grants[g] & ~frees[g][2] for g in range(len(groups))])),
+            rsp_drops.eq(rsp_drops + count([frees[g][0] for g in range(len(groups))])),
         ]
 
     # Point to point compatibility (port 0).

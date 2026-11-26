@@ -153,7 +153,7 @@ class TestFabricNetworkBench(unittest.TestCase):
                 results["forwarded"] += (yield node.forwarded)
                 results["drops"]     += (yield node.requester.stale)
                 for port in node.ports:
-                    results["drops"] += (yield port.rx_drops) + (yield port.resyncs)
+                    results["drops"] += (yield port.rx_drops)
         run_simulation(dut, generator())
         self.assertEqual(results["done"], 1)
         node, step = results["failed"]
