@@ -179,6 +179,11 @@ class TestFabricNetworkBench(unittest.TestCase):
         # One packet out of 10 lost on every link: sent again, every request served once.
         sim, dut, results = self.run_bench(nodes=4, loss=26, scenarios=["all", "hotspot", "errors"])
 
+    def test_4_nodes_wide(self):
+        # 128 bits per cycle on the links, with and without losses.
+        self.run_bench(nodes=4, link_width=128)
+        self.run_bench(nodes=4, link_width=64, loss=26, scenarios=["all", "hotspot", "errors"])
+
     def test_4_nodes_hypercube(self):
         # Requests forwarded by a node (2 links), and going around the node cut.
         sim, dut, results = self.run_bench(nodes=4, topology="hypercube")
