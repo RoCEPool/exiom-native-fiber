@@ -296,18 +296,46 @@ class TestFabricNetwork(unittest.TestCase):
             all_to_all(self, dut, salt=1, check_hops=False),
         ])
 
+    def test_wide_links(self):
+        # 128 bits per cycle (a whole packet), with and without losses, up to 16 nodes.
+        dut = DUT(two_tier(4), link_width=128)
+        run(dut, [
+            all_to_all(self, dut, check_hops=False),
+            random_traffic(self, dut),
+            hotspot(self, dut),
+            node_down(self, dut, down=2),
+        ])
+        dut = DUT(two_tier(8), link_width=128, loss=26, buffer_depth=2, queue_depth=1, request_timeout=60000)
+        self.lossy(dut, [
+            all_to_all(self, dut),
+            random_traffic(self, dut, requests=16),
+            hotspot(self, dut, writes=3),
+        ])
+        dut = DUT(two_tier(16), link_width=64)
+        run(dut, [
+            all_to_all(self, dut),
+            random_traffic(self, dut, requests=8),
+        ])
+
     def test_throughput(self):
-        # Requests per 1000 cycles, word-level links (floors about 25 % under the rates measured).
-        dut = DUT(two_tier(2))
-        run(dut, [
-            flood(self, dut, [0],    lambda src, prng: 1,       200, floor=105),
-            flood(self, dut, [0, 1], lambda src, prng: 1 - src, 200, floor=120),
-        ])
-        dut = DUT(two_tier(4))
-        run(dut, [
-            flood(self, dut, [1, 2, 3],    lambda src, prng: 0, 100, floor=140), # One destination.
-            flood(self, dut, [0, 1, 2, 3], lambda src, prng: (src + 1 + prng.randrange(3)) % 4, 100, floor=380),
-        ])
+        # Requests per 1000 cycles (floors about 25 % under the rates measured), with links of 32
+        # bits per cycle and of 128 bits per cycle (a whole packet).
+        one       = lambda src, prng: 1
+        other     = lambda src, prng: 1 - src
+        zero      = lambda src, prng: 0
+        any_other = lambda src, prng: (src + 1 + prng.randrange(3)) % 4
+        for link_width, floors in [(32, [110, 135, 165, 530]), (128, [275, 360, 235, 565])]:
+            with self.subTest(link_width=link_width):
+                dut = DUT(two_tier(2), link_width=link_width)
+                run(dut, [
+                    flood(self, dut, [0],    one,   200, floor=floors[0]),
+                    flood(self, dut, [0, 1], other, 200, floor=floors[1]),
+                ])
+                dut = DUT(two_tier(4), link_width=link_width)
+                run(dut, [
+                    flood(self, dut, [1, 2, 3],    zero,      100, floor=floors[2]), # One destination.
+                    flood(self, dut, [0, 1, 2, 3], any_other, 100, floor=floors[3]),
+                ])
 
     def test_4_nodes_backpressure(self):
         # Smallest buffers, slow memories: no packet dropped, nothing stalls.

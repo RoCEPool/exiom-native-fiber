@@ -10,10 +10,12 @@ Fabric: tagged request/response remote memory access between symmetric nodes, ov
 Every node is a Requester (sends read/write requests to other nodes, several can be in flight),
 a Responder (executes the requests received on its memory window and answers them) and a switch
 (forwards the packets of other nodes between its ports, following a static route table). The
-Fabric only needs a packet stream per port (``packet_description(32)``: a SerWB port today, see
+Fabric only needs a packet stream per port (a SerWB port today, see
 ``FabricNode.connect_serwb``), not SerWB itself.
 
-Packet (32-bit words, 2 to 4 words):
+Links carry ``link_width`` bits per cycle: 32 (one word, SerWB), 64 or 128 (a whole packet).
+
+Packet (32-bit words, 2 to 4 words; the number of words follows from the kind of packet):
 
 - Word 0 (route)       : [7:0] destination node, [15:8] source node, [18:16] hop limit,
                          [23:19] sequence number on the link, [24] response, [25] flow control,
@@ -114,6 +116,14 @@ def route_word(dst, src, ttl, rsp):
         Constant(0, 3), Constant(FABRIC_MAGIC, 4))
 
 FABRIC_WINDOW = 8 # Packets sent and not yet acknowledged, per port.
+
+def fabric_packet_len(w0, w1, fc_len):
+    """Number of words of a packet, from its first two words (the link does not carry it)."""
+    return Mux(route_fc(w0), fc_len,
+        Mux(route_rt(w0), 4,
+        Mux(route_rsp(w0),
+            Mux(w1[12], 2, 3),    # Write response, read response.
+            Mux(w1[12], 4, 3))))  # Write request, read request.
 
 def route_dst(w0):   return w0[0:8]
 def route_src(w0):   return w0[8:16]
@@ -460,7 +470,8 @@ class FabricRequester(LiteXModule):
         self.comb += [
             tag.eq(Cat(alloc_slot, Array(gens)[alloc_slot])),
             tx.valid.eq(tx_valid),
-            sink.ready.eq(~tx_valid & ~free_encoder.n),
+            # The next request is taken when the packet of the previous one leaves.
+            sink.ready.eq((~tx_valid | tx.ready) & ~free_encoder.n),
             alloc.eq(sink.valid & sink.ready),
         ]
         self.sync += [
@@ -508,83 +519,91 @@ class FabricResponder(LiteXModule):
         self.comb += rx.connect(fifo.sink)
         sink = fifo.source
 
-        # Request.
-        # --------
-        src    = Signal(8)
-        tag    = Signal(8)
-        sel    = Signal(4)
-        we     = Signal()
-        adr    = Signal(32)
-        dat_w  = Signal(32)
-        dat_r  = Signal(32)
-        status = Signal(4)
-
-        # Watchdog.
-        # ---------
-        self.timer = timer = WaitTimer(timeout)
-
-        # FSM.
-        # ----
+        # Request at the head of the buffer.
+        # ----------------------------------
+        we      = Signal()
+        local   = Signal()
+        refused = Signal(4) # Status when the request is not executed (FABRIC_OK: executed).
         self.comb += [
-            mem.adr.eq(adr),
-            mem.we.eq(we),
-            mem.sel.eq(sel),
-            mem.dat_w.eq(dat_w),
-            tx.w0.eq(route_word(src, Constant(node_id, 8), max_hops, 1)),
-            tx.w1.eq(Cat(tag, status, we)),
-            tx.w2.eq(dat_r),
-            tx.len.eq(Mux(we, 2, 3)),
+            we.eq(sink.w1[12]),
+            local.eq(route_dst(sink.w0) == node_id),
+            refused.eq(FABRIC_OK),
+            If(~local,
+                refused.eq(FABRIC_NODE)
+            ).Elif(sink.w2 >= words,
+                refused.eq(FABRIC_RANGE)
+            ).Elif(we & int(read_only),
+                refused.eq(FABRIC_RO)
+            ),
         ]
-        self.fsm = fsm = FSM(reset_state="REQUEST")
-        fsm.act("REQUEST",
-            sink.ready.eq(1),
+
+        # Response: one packet waiting to be taken by the switch.
+        # --------------------------------------------------------
+        tx_valid = Signal()
+        free     = Signal() # A response can be stored at the end of this cycle.
+        respond  = Signal()
+        status   = Signal(4)
+        dat_r    = Signal(32)
+        self.comb += [
+            tx.valid.eq(tx_valid),
+            free.eq(~tx_valid | tx.ready),
+        ]
+        self.sync += [
+            If(tx.valid & tx.ready,
+                tx_valid.eq(0)
+            ),
+            If(respond,
+                tx_valid.eq(1),
+                tx.w0.eq(route_word(route_src(sink.w0), Constant(node_id, 8), max_hops, 1)),
+                tx.w1.eq(Cat(sink.w1[0:8], status, we)),
+                tx.w2.eq(dat_r),
+                tx.len.eq(Mux(we, 2, 3)),
+                requests.eq(requests + 1),
+            )
+        ]
+
+        # Execution: the memory is accessed from the request itself, which leaves the buffer with
+        # its response (a request every two cycles with a memory answering in one).
+        # ---------------------------------------------------------------------------------
+        self.timer = timer = WaitTimer(timeout) # Watchdog.
+        access  = Signal() # Memory access of the request.
+        started = Signal() # Access started: goes to its end.
+        well    = Signal() # Well formed.
+        self.comb += [
+            well.eq(sink.len == Mux(we, 4, 3)),
+            access.eq(sink.valid & well & (refused == FABRIC_OK) & (started | free)),
+            mem.cyc.eq(access),
+            mem.stb.eq(access),
+            mem.adr.eq(sink.w2),
+            mem.we.eq(we),
+            mem.sel.eq(sink.w1[8:12]),
+            mem.dat_w.eq(sink.w3),
+            timer.wait.eq(access & ~respond), # Per request.
             If(sink.valid,
-                NextValue(src,   route_src(sink.w0)),
-                NextValue(tag,   sink.w1[0:8]),
-                NextValue(sel,   sink.w1[8:12]),
-                NextValue(we,    sink.w1[12]),
-                NextValue(adr,   sink.w2),
-                NextValue(dat_w, sink.w3),
-                NextValue(dat_r, 0),
-                If(sink.len != Mux(sink.w1[12], 4, 3),
-                    NextValue(malformed, malformed + 1)
-                ).Elif(route_dst(sink.w0) != node_id,
-                    NextValue(status, FABRIC_NODE),
-                    NextState("RESPONSE")
-                ).Elif(sink.w2 >= words,
-                    NextValue(status, FABRIC_RANGE),
-                    NextState("RESPONSE")
-                ).Elif(sink.w1[12] & int(read_only),
-                    NextValue(status, FABRIC_RO),
-                    NextState("RESPONSE")
-                ).Else(
-                    NextState("MEMORY")
-                )
-            )
-        )
-        fsm.act("MEMORY",
-            mem.cyc.eq(1),
-            mem.stb.eq(1),
-            timer.wait.eq(1),
-            If(mem.ack,
-                NextValue(dat_r,  mem.dat_r),
-                NextValue(status, FABRIC_OK),
-                NextState("RESPONSE")
-            ).Elif(mem.err,
-                NextValue(status, FABRIC_BUS),
-                NextState("RESPONSE")
-            ).Elif(timer.done,
-                NextValue(status, FABRIC_TIMEOUT),
-                NextState("RESPONSE")
-            )
-        )
-        fsm.act("RESPONSE",
-            tx.valid.eq(1),
-            If(tx.ready,
-                NextValue(requests, requests + 1),
-                NextState("REQUEST")
-            )
-        )
+                If(~well,
+                    sink.ready.eq(1)
+                ).Elif(refused != FABRIC_OK,
+                    status.eq(refused),
+                    respond.eq(free),
+                ).Elif(access & mem.ack,
+                    status.eq(FABRIC_OK),
+                    dat_r.eq(mem.dat_r),
+                    respond.eq(1),
+                ).Elif(access & mem.err,
+                    status.eq(FABRIC_BUS),
+                    respond.eq(1),
+                ).Elif(access & timer.done,
+                    status.eq(FABRIC_TIMEOUT),
+                    respond.eq(1),
+                ),
+                If(respond, sink.ready.eq(1)),
+            ),
+        ]
+        self.sync += [
+            If(access, started.eq(1)),
+            If(respond | ~access, started.eq(0)),
+            If(sink.valid & sink.ready & ~well, malformed.eq(malformed + 1)),
+        ]
 
 # Fabric Port --------------------------------------------------------------------------------------
 
@@ -597,14 +616,18 @@ class FabricPort(LiteXModule):
     ``tx_class`` (accepted when the port has room; the switch checks ``credit[tx_class]`` first).
     ``ctl``/``rt``: route packets to send (between two packets, without credit) and received.
     ``retry_timeout``: cycles without acknowledgment before the packets not acknowledged are sent
-    again (default: ``fc_period``).
+    again (default: ``fc_period``). ``link_width``: bits of the packet stream per cycle (32, 64 or
+    128: 1, 2 or 4 words; words in the order of the packet, first word in the low bits).
     """
-    def __init__(self, max_hops=1, queue_depth=4, fc_period=256, retry_timeout=None, link_ready=None):
+    def __init__(self, max_hops=1, queue_depth=4, fc_period=256, retry_timeout=None, link_width=32,
+        link_ready=None):
         assert 1 <= max_hops <= 6 and 1 <= queue_depth <= 8 and fc_period >= 16
+        assert link_width in [32, 64, 128]
         retry_timeout = fc_period if retry_timeout is None else retry_timeout
+        self.link_width = link_width
         self.classes  = classes = 2*max_hops
-        self.sink     = sink    = stream.Endpoint(packet_description(32))
-        self.source   = source  = stream.Endpoint(packet_description(32))
+        self.sink     = sink    = stream.Endpoint(packet_description(link_width))
+        self.source   = source  = stream.Endpoint(packet_description(link_width))
         self.queues   = queues  = []
         self.tx       = tx      = stream.Endpoint(fabric_packet_layout())
         self.tx_class = Signal(max=classes)
@@ -628,31 +651,37 @@ class FabricPort(LiteXModule):
 
         # RX: Packet stream to whole packets.
         # -----------------------------------
+        fc_len    = 1 + (classes + 3)//4
+        wpb       = link_width//32          # Words per cycle.
+        max_beats = (4 + wpb - 1)//wpb      # Cycles of the longest packet.
+        def beats_of(length):
+            return {1: length, 2: (length + 1)[1:3], 4: 1}[wpb]
+
         rx       = stream.Endpoint(fabric_packet_layout()) # Whole packet, one cycle.
-        rx_words = [Signal(32, name=f"rx_w{i}") for i in range(3)]
-        rx_count = Signal(3) # Words of the current packet already received (saturating).
-        rx_bad   = Signal()  # Packet cut or too long.
+        rx_words = [Signal(32, name=f"rx_w{i}") for i in range(4)]
+        rx_beat  = Signal(3) # Cycles of the current packet already received (saturating).
+        rx_bad   = Signal()  # Packet cut, or not the number of words of its kind.
+        rx_w     = [rx.w0, rx.w1, rx.w2, rx.w3]
+        self.comb += sink.ready.eq(1) # The link has no backpressure.
+        for i in range(4):
+            # Word i comes in cycle i//wpb of the packet.
+            self.comb += rx_w[i].eq(Mux(rx_beat == (i//wpb), sink.data[32*(i % wpb):32*(i % wpb) + 32], rx_words[i]))
+            self.sync += If(sink.valid & (rx_beat == (i//wpb)), rx_words[i].eq(sink.data[32*(i % wpb):32*(i % wpb) + 32]))
         self.comb += [
-            sink.ready.eq(1), # The link has no backpressure.
-            rx.w0.eq(Mux(rx_count == 0, sink.data, rx_words[0])),
-            rx.w1.eq(Mux(rx_count == 1, sink.data, rx_words[1])),
-            rx.w2.eq(Mux(rx_count == 2, sink.data, rx_words[2])),
-            rx.w3.eq(sink.data),
-            rx.len.eq(rx_count + 1),
-            rx_bad.eq(sink.error | (rx_count >= 4)),
+            rx.len.eq(fabric_packet_len(rx.w0, rx.w1, fc_len)),
+            rx_bad.eq(sink.error | ((rx_beat + 1) != beats_of(rx.len))),
             rx.valid.eq(sink.valid & sink.last & ~rx_bad & up),
         ]
         self.sync += [
             If(sink.valid,
-                Case(rx_count, {i: rx_words[i].eq(sink.data) for i in range(3)}),
                 If(sink.last,
-                    rx_count.eq(0)
-                ).Elif(rx_count != 7,
-                    rx_count.eq(rx_count + 1)
+                    rx_beat.eq(0)
+                ).Elif(rx_beat != 7,
+                    rx_beat.eq(rx_beat + 1)
                 )
             ),
             # Link down: a packet cut by the link loss is not continued by the next one.
-            If(~up, rx_count.eq(0)),
+            If(~up, rx_beat.eq(0)),
         ]
 
         # RX: Class of the packet.
@@ -671,8 +700,7 @@ class FabricPort(LiteXModule):
             rx.connect(rt, omit={"valid", "ready"}),
             rt.valid.eq(rx_rt),
             # Hop limit of a received packet: max_hops (first link) to 1 (last link allowed).
-            rx_data.eq(rx_ok & ~route_fc(rx.w0) & ~route_rt(rx.w0) & (rx.len >= 2) &
-                (rx_ttl >= 1) & (rx_ttl <= max_hops)),
+            rx_data.eq(rx_ok & ~route_fc(rx.w0) & ~route_rt(rx.w0) & (rx_ttl >= 1) & (rx_ttl <= max_hops)),
             rx_class.eq(Mux(route_rsp(rx.w0), max_hops, 0) + (max_hops - rx_ttl)),
         ]
         self.sync += [
@@ -772,13 +800,12 @@ class FabricPort(LiteXModule):
         tx_r     = [Signal(4, name=f"tx_r{c}") for c in range(classes)]
         tx_l     = [Signal(4, reset=queue_depth, name=f"tx_l{c}") for c in range(classes)]
         tx_idle  = [Signal(max=4*fc_period + 1, name=f"tx_idle{c}") for c in range(classes)]
-        fc_len   = 1 + (classes + 3)//4
         fc_ok    = Signal() # Flow control packet received.
         sent     = Signal()
         resynced = []
         self.comb += [
             sent.eq(tx.valid & tx.ready & up),
-            fc_ok.eq(rx_fc & (rx.len == fc_len)),
+            fc_ok.eq(rx_fc),
         ]
         for c in range(classes):
             room   = Signal(4, name=f"tx_room{c}")
@@ -867,7 +894,6 @@ class FabricPort(LiteXModule):
         behind       = Signal(5)
         self.comb += [
             retry_timer.wait.eq((tx_acked != tx_tail) & ~progress & ~rewind_apply),
-            send_n.eq(Mux(rewind_apply, acked_n, Mux(packet_done, tx_cur + 1, tx_send))),
             behind.eq(send_n - acked_n),
         ]
         self.sync += [
@@ -930,23 +956,51 @@ class FabricPort(LiteXModule):
             If(~up, dirty.eq(0)),
         ]
 
-        index      = Signal(2)
+        index      = Signal(2) # Cycle of the packet being sent.
         cur_slot   = Signal(slot)
         cur_len    = Signal(3)
         send_slot  = Signal(slot)
+        send_len   = Signal(3)
+        sending    = Signal(5) # Sequence number of the packet whose last cycle is sent.
         fc_latched = [Signal(32, name=f"fc_l{i}") for i in range(4)]
         self.sync += If(fc_sent, *[fc_latched[i].eq(fc_words[i]) for i in range(4)])
         self.comb += [
             send_slot.eq(tx_send[:slot]),
+            send_len.eq(Array(buf_len)[send_slot]),
             cur_slot.eq(tx_cur[:slot]),
             cur_len.eq(Array(buf_len)[cur_slot]),
+            send_n.eq(Mux(rewind_apply, acked_n, Mux(packet_done, sending + 1, tx_send))),
         ]
+
+        def beat(words, n):
+            """Words of the cycle n of a packet (words: 4 Signals, or 4 functions of nothing)."""
+            beats = []
+            for b in range(max_beats):
+                beats.append(Cat(*[words[b*wpb + j] if (b*wpb + j) < 4 else Constant(0, 32) for j in range(wpb)]))
+            return beats[n] if isinstance(n, int) else Array(beats)[n]
+
+        def send(words, length, done):
+            """Statements sending the cycle `index` of a packet."""
+            return [
+                source.valid.eq(1),
+                source.length.eq(Cat(Constant(0, 2), length)),
+                source.data.eq(beat(words, index)),
+                source.last.eq(index == (beats_of(length) - 1)),
+                If(source.ready,
+                    NextValue(index, index + 1),
+                    If(source.last, *done)
+                )
+            ]
+
+        send_words = [Array(buf[w])[send_slot] for w in range(4)]
+        cur_words  = [Array(buf[w])[cur_slot]  for w in range(4)]
         self.tx_fsm = tx_fsm = ResetInserter()(FSM(reset_state="IDLE"))
         self.comb += tx_fsm.reset.eq(~up)
         ctl_words = [Signal(32, name=f"ctl_w{i}") for i in range(4)]
         ctl_len   = Signal(3)
         tx_fsm.act("IDLE",
             NextValue(index, 0),
+            sending.eq(tx_send),
             If(fc_request,
                 fc_sent.eq(1),
                 NextState("FLOW-CONTROL")
@@ -961,47 +1015,30 @@ class FabricPort(LiteXModule):
                 NextValue(ctl_len,      ctl.len),
                 NextState("CONTROL")
             ).Elif(available,
-                # First word of the packet: once presented, the packet is sent before anything else.
+                # First cycle of the packet: once presented, the packet is sent before anything
+                # else. A packet of one cycle is followed at once by the next one.
                 source.valid.eq(1),
-                source.length.eq(Cat(Constant(0, 2), Array(buf_len)[send_slot])),
-                source.data.eq(Array(buf[0])[send_slot]),
+                source.length.eq(Cat(Constant(0, 2), send_len)),
+                source.data.eq(beat(send_words, 0)),
+                source.last.eq(beats_of(send_len) == 1),
                 NextValue(tx_cur, tx_send),
-                If(source.ready, NextValue(index, 1)),
-                NextState("PACKET")
+                If(source.ready & source.last,
+                    packet_done.eq(1)
+                ).Else(
+                    If(source.ready, NextValue(index, 1)),
+                    NextState("PACKET")
+                )
             )
         )
         tx_fsm.act("CONTROL",
-            source.valid.eq(1),
-            source.length.eq(Cat(Constant(0, 2), ctl_len)),
-            source.data.eq(Array(ctl_words)[index]),
-            source.last.eq(index == (ctl_len - 1)),
-            If(source.ready,
-                NextValue(index, index + 1),
-                If(source.last, NextState("IDLE"))
-            )
+            *send(ctl_words, ctl_len, [NextState("IDLE")])
         )
         tx_fsm.act("FLOW-CONTROL",
-            source.valid.eq(1),
-            source.length.eq(4*fc_len),
-            source.data.eq(Array(fc_latched)[index]),
-            source.last.eq(index == (fc_len - 1)),
-            If(source.ready,
-                NextValue(index, index + 1),
-                If(source.last, NextState("IDLE"))
-            )
+            *send(fc_latched, Constant(fc_len, 3), [NextState("IDLE")])
         )
         tx_fsm.act("PACKET",
-            source.valid.eq(1),
-            source.length.eq(Cat(Constant(0, 2), cur_len)),
-            source.data.eq(Array([Array(buf[w])[cur_slot] for w in range(4)])[index]),
-            source.last.eq(index == (cur_len - 1)),
-            If(source.ready,
-                NextValue(index, index + 1),
-                If(source.last,
-                    packet_done.eq(1),
-                    NextState("IDLE")
-                )
-            )
+            sending.eq(tx_cur),
+            *send(cur_words, cur_len, [packet_done.eq(1), NextState("IDLE")])
         )
 
 # Fabric Node --------------------------------------------------------------------------------------
@@ -1024,6 +1061,7 @@ class FabricNode(LiteXModule):
         route_period    = None,
         route_entries   = ROUTE_ENTRIES,
         retry_timeout   = None,
+        link_width      = 32,
         link_ready      = None,
     ):
         assert 0 <= node_id < 256 and ports >= 1
@@ -1061,7 +1099,7 @@ class FabricNode(LiteXModule):
         self.ports = fports = []
         for p in range(ports):
             port = FabricPort(max_hops=max_hops, queue_depth=queue_depth, fc_period=fc_period,
-                retry_timeout=retry_timeout, link_ready=link_ready[p])
+                retry_timeout=retry_timeout, link_width=link_width, link_ready=link_ready[p])
             self.add_module(f"port{p}", port)
             fports.append(port)
             self.comb += requester.port_up[p].eq(port.up)
@@ -1215,6 +1253,7 @@ class FabricNode(LiteXModule):
 
     def connect_serwb(self, core, port=0, serwb_port=FABRIC_PORT):
         """Use a port of a SERWBCore as link of port ``port`` (before the core is finalized)."""
+        assert self.ports[port].link_width == 32, "SerWB links carry 32 bits per cycle."
         core.add_downstream_endpoint(port=serwb_port, endpoint=self.ports[port].source)
         core.add_upstream_endpoint(  port=serwb_port, endpoint=self.ports[port].sink)
 
