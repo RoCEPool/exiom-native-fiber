@@ -11,8 +11,8 @@ Fabric end-to-end Verilator simulations:
 
 - Two symmetric nodes, one bit-level SerWB link: requests in flight in both directions, errors in
   flight with valid requests, link cut and recovery.
-- Networks of 4 and 8 nodes (word-level links): all nodes to all nodes over up to 3 links,
-  hotspot, errors, one node cut from the fabric and back.
+- Networks of 4 nodes (word-level links, 32 and 128 bits per cycle, with and without packets
+  lost): all nodes to all nodes, hotspot, errors, one node cut from the fabric and back.
 
 Uses the self-checking FabricTestSoC of bench/fabric/sim.py. Skipped when Verilator is not installed.
 """
@@ -34,13 +34,13 @@ CONFIGS = {
     # Networks, word-level links (two-tier topology cabled for 16 nodes).
     "4_nodes"              : ["--nodes", "4"],
     "4_nodes_small_buffers": ["--nodes", "4", "--queue-depth", "1", "--sram-latency", "20"],
-    "8_nodes"              : ["--nodes", "8", "--sram-latency", "8"],
-    "8_nodes_hypercube"    : ["--nodes", "8", "--topology", "hypercube"],
-    "8_nodes_lossy"        : ["--nodes", "8", "--loss", "26", "--scenarios", "all,hotspot,errors"],
-    "8_nodes_wide"         : ["--nodes", "8", "--link-width", "128"],
-    "8_nodes_wide_lossy"   : ["--nodes", "8", "--link-width", "128", "--loss", "26", "--scenarios", "all,hotspot,errors"],
-    # 16 nodes: with the Migen simulator (test_fabric_network.py); their Verilator build needs more
-    # memory than the CI runner has (./bench/fabric/sim.py --nodes 16 on a larger machine).
+    "4_nodes_hypercube"    : ["--nodes", "4", "--topology", "hypercube"],
+    "4_nodes_lossy"        : ["--nodes", "4", "--loss", "26", "--scenarios", "all,hotspot,errors"],
+    "4_nodes_wide"         : ["--nodes", "4", "--link-width", "128"],
+    "4_nodes_wide_lossy"   : ["--nodes", "4", "--link-width", "128", "--loss", "26", "--scenarios", "all,hotspot,errors"],
+    # 8 and 16 nodes: with the Migen simulator (test_fabric_network.py, test_fabric_bench.py);
+    # their Verilator build needs more memory than the CI runner has (./bench/fabric/sim.py
+    # --nodes 8 on a larger machine).
 }
 
 @unittest.skipUnless(shutil.which("verilator"), "Verilator not installed.")

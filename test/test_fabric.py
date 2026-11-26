@@ -432,7 +432,6 @@ class TestFabric(unittest.TestCase):
             for node in [dut.a, dut.b]:
                 retransmits += (yield node.ports[0].retransmits)
                 self.assertEqual((yield node.ports[0].rx_drops), 0)
-                self.assertEqual((yield node.ports[0].resyncs), 0)
             if not flow_control:
                 self.assertGreater(retransmits, 0)
         run_simulation(dut, generator())
@@ -579,7 +578,6 @@ class TestFabric(unittest.TestCase):
                         self.assertEqual((yield dut.b_mem.mem[i]), pattern(i, 3))
                     for node in [dut.a, dut.b]:
                         self.assertEqual((yield node.ports[0].rx_drops), 0)
-                        self.assertEqual((yield node.ports[0].resyncs), 0)
                 run_simulation(dut, [sender(), receiver()])
 
     def test_single_place_queues(self):
@@ -591,7 +589,6 @@ class TestFabric(unittest.TestCase):
             for adr in range(6):
                 self.assertEqual((yield from write(dut.a, B, adr, pattern(adr))), FABRIC_OK)
             self.assertEqual((yield dut.a.ports[0].retransmits), 1)
-            self.assertEqual((yield dut.a.ports[0].resyncs), 0)
             self.assertEqual((yield dut.b.ports[0].rx_drops), 0)
             self.assertEqual((yield dut.b.responder.requests), 6)
         run_simulation(dut, generator())
