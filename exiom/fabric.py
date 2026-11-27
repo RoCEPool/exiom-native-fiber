@@ -967,6 +967,7 @@ class FabricPort(LiteXModule):
         self.tx_drops   = tx_drops   = Signal(32) # Packets dropped (link down).
         self.retransmits = retransmits = Signal(32) # Times packets were sent again.
         self.rx_discards = rx_discards = Signal(32) # Packets discarded (not the one expected).
+        self.tx_packets  = tx_packets  = Signal(32) # Packets accepted to be sent (sent once each).
 
         # # #
 
@@ -1136,6 +1137,7 @@ class FabricPort(LiteXModule):
             sent.eq(tx.valid & tx.ready & up),
             fc_ok.eq(rx_fc),
         ]
+        self.sync += If(sent, tx_packets.eq(tx_packets + 1))
         for c in range(classes):
             room = Signal(4, name=f"tx_room{c}")
             # Flow control word: classes 4n to 4n+3, {L, R} each.
