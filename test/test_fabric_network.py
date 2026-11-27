@@ -35,9 +35,9 @@ from test.fabric_sim import run_simulation # Same simulator, starts faster on la
 # DUT ----------------------------------------------------------------------------------------------
 
 class DUT(LiteXModule):
-    def __init__(self, topology, mem_kwargs={}, **kwargs):
+    def __init__(self, topology, mem_kwargs={}, size=256, **kwargs):
         self.topology = topology
-        self.net  = FabricNetwork(topology, size=256, fc_period=64, **kwargs)
+        self.net  = FabricNetwork(topology, size=size, fc_period=64, **kwargs)
         self.mems = []
         for n, node in enumerate(self.net.nodes):
             mem = Memory(node.responder.mem, **mem_kwargs)
