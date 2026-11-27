@@ -79,7 +79,7 @@ def idle(test, dut):
     yield from wait(64)
     for node in dut.nodes:
         test.assertEqual((yield node.requester.pending), 0)
-        test.assertEqual((yield node.copy.cmd.ready), 1)
+        test.assertEqual((yield node.copy.busy), 0)
     yield from dut.check_no_drop(test)
 
 # Pool DUT -----------------------------------------------------------------------------------------
@@ -207,8 +207,9 @@ class TestFabricCopy(unittest.TestCase):
         run(dut, [generator()])
 
     def test_copy_busy(self):
-        # Second copy asked to a node that is copying: refused at once, the first one goes on.
-        dut = DUT(two_tier(4))
+        # Second copy asked to a node that is copying and runs one copy at a time: refused at
+        # once, the first one goes on.
+        dut = DUT(two_tier(4), copy_lanes=1)
         def generator():
             yield from fill(dut, 1, 32, 32)
             first = yield from copy_request(dut.nodes[0], 1, 32, 2, 32, 32)
@@ -220,6 +221,37 @@ class TestFabricCopy(unittest.TestCase):
             yield from check(self, dut, 1, 32, 2, 32, 32)
             # Free again.
             self.assertEqual((yield from copy(dut.nodes[3], 1, 32, 3, 32, 4)), (FABRIC_OK, 4))
+            yield from idle(self, dut)
+        run(dut, [generator()])
+
+    def test_copy_lanes(self):
+        # Two copies at a time per node (default): two nodes copy from the same node at the same
+        # time, a third one is refused.
+        dut = DUT(two_tier(4))
+        def generator():
+            yield from fill(dut, 1, 32, 32)
+            first  = yield from copy_request(dut.nodes[0], 1, 32, 2, 32, 32)
+            second = yield from copy_request(dut.nodes[3], 1, 32, 3, 32, 32)
+            yield from wait(20)
+            self.assertEqual((yield dut.nodes[1].copy.busy), 2)
+            self.assertEqual((yield from copy(dut.nodes[2], 1, 32, 0, 32, 4)), (FABRIC_BUSY, 0))
+            tag, we, status, count = yield from result(dut.nodes[0])
+            self.assertEqual((tag, status, count), (first, FABRIC_OK, 32))
+            tag, we, status, count = yield from result(dut.nodes[3])
+            self.assertEqual((tag, status, count), (second, FABRIC_OK, 32))
+            yield from check(self, dut, 1, 32, 2, 32, 32)
+            yield from check(self, dut, 1, 32, 3, 32, 32)
+            self.assertEqual((yield dut.nodes[1].copy.copies), 2)
+            self.assertEqual((yield dut.nodes[1].copy.words), 64)
+            # One of them ends with an error: the other one is not disturbed.
+            first  = yield from copy_request(dut.nodes[0], 1, 32, 2, 60, 32) # Past the end.
+            second = yield from copy_request(dut.nodes[3], 1, 40, 3, 0, 16)
+            tag, we, status, count = yield from result(dut.nodes[0])
+            self.assertEqual((tag, status), (first, FABRIC_RANGE))
+            tag, we, status, count = yield from result(dut.nodes[3])
+            self.assertEqual((tag, status, count), (second, FABRIC_OK, 16))
+            yield from check(self, dut, 1, 40, 3, 0, 16)
+            self.assertEqual((yield dut.nodes[1].copy.errors), 1)
             yield from idle(self, dut)
         run(dut, [generator()])
 
@@ -374,8 +406,9 @@ class TestFabricPool(unittest.TestCase):
         run(dut, [generator()])
 
     def test_copy_busy(self):
-        # Two nodes asking copies to the same source node: each one is asked again until served.
-        dut = PoolDUT(two_tier(4), pools=(0, 3), chunk=16)
+        # Two nodes asking copies to the same source node, which runs one copy at a time: each
+        # one is asked again until served.
+        dut = PoolDUT(two_tier(4), pools=(0, 3), chunk=16, copy_lanes=1)
         def generator():
             for n in range(4):
                 yield from fill(dut, n, 0, WORDS)

@@ -214,7 +214,9 @@ access per cycle):
 |---|---|---|---|---|
 | Sources all different, inside the chassis   | 3606 | 6564 | 4.4 / 2.4 | 0 / 0      |
 | Sources all different, to the other chassis | 3556 | 6400 | 4.5 / 2.5 | 0 / 0      |
-| All from node 0                             | 324  | 500  | 33 / 23   | 1119 / 960 |
+| All from node 0, one copy at a time per node | 324 | 500  | 33 / 23   | 1119 / 960 |
+| All from node 0, 2 copies at a time (default) | 420 | 734 | 25 / 14   | 572 / 458  |
+| All from node 0, 4 copies at a time          | 446 | 818  | 25 / 14   | 393 / 331  |
 
 What the numbers say, in the order the limits appear:
 
@@ -226,9 +228,11 @@ What the numbers say, in the order the limits appear:
    port** the Responder sends an access per cycle and does not wait for the answers: bursts and
    copies about double (1000 words per 1000 cycles per node at most). Single words gain little:
    their limit is the 8 requests in flight per node and the 20 cycles of a round trip.
-2. **One copy at a time per source node**: with one source for all, the node that copies is free
-   between two copies (about 1000 retries); with the memory port it copies 500 words per 1000
-   cycles where its memory could give 1000.
+2. **Copies at a time per source node** (`copy_lanes`): with one source for all and one copy at
+   a time, the node that copies is free between two copies (about 1000 retries); with the memory
+   port it copies 500 words per 1000 cycles where its memory could give 1000. Two copies at a
+   time (the default) give 734, four give 818; the rest is the time between a refusal and the next
+   try of the nodes that ask (`busy_wait` of `FabricPool`).
 3. **The links are not the limit at this size**: traffic inside the chassis and traffic to all
    the nodes give the same throughput; the busiest cable between the chassis carries 427 packets
    per 1000 cycles with single words (a 128-bit link moves 1000) and 133 with bursts (3 cycles
@@ -271,11 +275,12 @@ its own burst requests, `copy_window` bursts in flight (default 4): the data goe
 source node to the destination node, whichever node asked. The other nodes forward a copy request
 like any request; switches and ports are not modified.
 
-- One copy at a time per source node. A copy request received during another one is refused at
-  once with `FABRIC_BUSY`: it never waits in the Responder, so nodes copying to each other cannot
-  wait for each other, and the Responder keeps serving the other requests during a copy.
-- The requests of a copy share the slots of the Requester of the source node with the requests
-  of its user, served in turn.
+- A node runs `copy_lanes` copies at a time (default 2). A copy request received while they are
+  all running is refused at once with `FABRIC_BUSY`: it never waits in the Responder, so nodes
+  copying to each other cannot wait for each other, and the Responder keeps serving the other
+  requests during a copy.
+- The requests of the copies share the slots of the Requester of the source node with the
+  requests of its user, served in turn.
 - Result: first error and words written. Source words outside the window: `FABRIC_RANGE`, nothing
   copied. Error on the way (destination window, node that cannot be reached, memory error): no
   more word is read, the words already written stay. Statuses 8 and 9 in a copy result are those
@@ -340,7 +345,7 @@ scenarios) a 32-bit link becomes the limit again (11 cycles for a burst of 8 wor
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
 - A Responder with a Wishbone memory executes one request at a time, two cycles per word; with
   the memory port, one word per cycle (see Performance scenarios).
-- Copies: one at a time per source node (see Copies and global addresses);
+- Copies: `copy_lanes` at a time per source node (see Copies and global addresses);
   no entry yet for a host to ask for a copy (the user of `FabricPool` is the test bench).
 
 ## Verification
@@ -368,7 +373,7 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
 - `test_fabric_copy.py`: 2 and 4 nodes. Copies asked by a third node, by the source, by the
   destination and inside one node (the node that asked executes and forwards nothing); errors
   (source and destination out of the window, nodes that do not exist, memory that does not answer
-  or answers with an error); second copy refused while one runs; every node copying to the next
+  or answers with an error); second copy refused while one runs, two copies at a time from the same node; every node copying to the next
   one at the same time; copies with the other traffic; packets lost on every link; destination
   and source node cut off during a copy. Global addresses: reads and writes, copies longer than a
   copy request and going from a node to the next ones, copy running past the last node, two nodes
