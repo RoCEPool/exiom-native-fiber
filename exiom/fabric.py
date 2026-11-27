@@ -145,6 +145,14 @@ def copy_layout():
     return [("src", 8), ("tag", 8), ("adr", FABRIC_ADDRESS_BITS), ("dst", 8),
         ("dst_adr", FABRIC_ADDRESS_BITS), ("words", 17)]
 
+def memory_cmd_layout():
+    # Memory port (exiom/memory.py): one word access.
+    return [("adr", FABRIC_ADDRESS_BITS), ("we", 1), ("dat_w", 32), ("sel", 4), ("id", 4)]
+
+def memory_rsp_layout():
+    # Memory port: response of an access, in the order of the accesses (``id`` of the access).
+    return [("dat_r", 32), ("err", 1), ("id", 4)]
+
 def result_layout():
     return [("tag", 8), ("we", 1), ("status", 4), ("dat_r", 32),
         ("count", 4), ("data", 32*FABRIC_BURST_WORDS)]
@@ -765,6 +773,235 @@ class FabricResponder(LiteXModule):
             If(sink.valid & sink.ready & ~well, malformed.eq(malformed + 1)),
         ]
 
+# Fabric Pipelined Responder -----------------------------------------------------------------------
+
+class FabricPipelinedResponder(LiteXModule):
+    """Executes the requests received on a memory port (``cmd``/``rsp``, see exiom/memory.py):
+    the accesses are sent one per cycle without waiting for their answers, the words of a burst
+    and the requests one after the other.
+
+    Same packets, checks and statuses as ``FabricResponder``, with these differences:
+    - all the words of a burst are accessed: after an error in a burst, the words after it may
+      have been written (the response still gives the words done before the first error);
+    - ``timeout`` is the time without any answer from the memory to the oldest request; a request
+      that times out reports no word done (which ones were is not known), and its answers are
+      dropped when they come later. A request whose answers are missing when the memory answers
+      a newer one ends at once with FABRIC_TIMEOUT.
+    ``pending``: requests sent to the memory and not yet answered, at most.
+    """
+    def __init__(self, node_id, size, max_hops=1, read_only=False, timeout=1024, buffer_depth=4, pending=4):
+        assert size % 4 == 0 and size >= 4
+        self.rx   = rx  = stream.Endpoint(fabric_packet_layout())
+        self.tx   = tx  = stream.Endpoint(fabric_packet_layout())
+        self.cmd  = cmd = stream.Endpoint(memory_cmd_layout())
+        self.rsp  = rsp = stream.Endpoint(memory_rsp_layout())
+        self.copy = copy = stream.Endpoint(copy_layout())
+
+        # Status.
+        self.requests  = requests  = Signal(32) # Requests answered.
+        self.malformed = malformed = Signal(32) # Requests dropped (wrong number of words).
+        self.late      = late      = Signal(32) # Answers of the memory dropped (request timed out).
+
+        # # #
+
+        words = size//4
+        burst = FABRIC_BURST_WORDS
+
+        # Request Buffer.
+        # ---------------
+        self.fifo = fifo = stream.SyncFIFO(fabric_packet_layout(), buffer_depth, buffered=True)
+        self.comb += rx.connect(fifo.sink)
+        sink = fifo.source
+
+        # Request at the head of the buffer.
+        # ----------------------------------
+        we       = Signal()
+        is_copy  = Signal()
+        is_burst = Signal()
+        count    = Signal(5) # Words of the request.
+        local    = Signal()
+        adr      = Signal(FABRIC_ADDRESS_BITS)
+        refused  = Signal(4) # Status when the request is not executed (FABRIC_OK: executed).
+        well     = Signal()  # Well formed.
+        self.comb += [
+            we.eq(sink.w1[12]),
+            is_copy.eq(sink.w1[12] & sink.w1[13]),
+            is_burst.eq(sink.w1[14] & ~is_copy),
+            count.eq(Mux(is_burst, sink.w1[8:12] + 1, 1)),
+            local.eq(route_dst(sink.w0) == node_id),
+            adr.eq(Cat(packet_words(sink)[2], sink.w1[16:32])),
+            copy.src.eq(route_src(sink.w0)),
+            copy.tag.eq(sink.w1[0:8]),
+            copy.adr.eq(adr),
+            copy.dst.eq(packet_words(sink)[4][0:8]),
+            copy.dst_adr.eq(Cat(packet_words(sink)[3], packet_words(sink)[4][16:32])),
+            copy.words.eq(packet_words(sink)[5][:16] + 1),
+            well.eq(sink.len == Mux(we, Mux(is_copy, 6, Mux(is_burst, 3 + count, 4)), 3)),
+            refused.eq(FABRIC_OK),
+            If(~local,
+                refused.eq(FABRIC_NODE)
+            ).Elif(adr >= words,
+                refused.eq(FABRIC_RANGE)
+            ).Elif(is_copy,
+                If(((adr + copy.words) > words) | (packet_words(sink)[5] >= FABRIC_COPY_WORDS), refused.eq(FABRIC_RANGE))
+            ).Elif((count > burst) | ((adr + count) > words),
+                refused.eq(FABRIC_RANGE)
+            ).Elif(we & int(read_only),
+                refused.eq(FABRIC_RO)
+            ),
+        ]
+
+        # Requests sent to the memory (or refused), in order, until they are answered.
+        # ------------------------------------------------------------------------------
+        self.descs = descs = stream.SyncFIFO([("src", 8), ("tag", 8), ("we", 1), ("burst", 1),
+            ("count", 5), ("status", 4), ("id", 4)], pending, buffered=True)
+        push = descs.sink
+        head = descs.source
+
+        # Accesses: one word per cycle.
+        # -----------------------------
+        started = Signal()  # Request of the head of the buffer given to the memory.
+        idx     = Signal(4) # Word to access.
+        rid     = Signal(4) # Number of the request (id of its accesses).
+        abort   = Signal()  # The request being sent timed out.
+        pushed  = Signal()
+        issued  = Signal()
+        leave   = Signal()  # The request leaves the buffer.
+        self.comb += [
+            push.src.eq(route_src(sink.w0)),
+            push.tag.eq(sink.w1[0:8]),
+            push.we.eq(we),
+            push.burst.eq(is_burst),
+            push.id.eq(rid),
+            pushed.eq(push.valid & push.ready),
+            cmd.adr.eq(adr + idx),
+            cmd.we.eq(we),
+            cmd.sel.eq(Mux(is_burst, 0b1111, sink.w1[8:12])),
+            cmd.dat_w.eq(Array(packet_words(sink)[3:3 + burst])[idx]),
+            cmd.id.eq(rid),
+            issued.eq(cmd.valid & cmd.ready),
+            If(sink.valid,
+                If(~well,
+                    leave.eq(1)
+                ).Elif(refused != FABRIC_OK,
+                    push.valid.eq(1),
+                    push.status.eq(refused),
+                    leave.eq(push.ready),
+                ).Elif(is_copy,
+                    # Taken by the copy engine (which answers it), or refused: never waits here.
+                    copy.valid.eq(1),
+                    If(copy.ready,
+                        leave.eq(1)
+                    ).Else(
+                        push.valid.eq(1),
+                        push.status.eq(FABRIC_BUSY),
+                        leave.eq(push.ready),
+                    )
+                ).Else(
+                    # The request is announced with its first access.
+                    push.valid.eq(~started),
+                    push.count.eq(count),
+                    cmd.valid.eq(started | push.ready),
+                    leave.eq(abort | (issued & (idx == (count - 1)))),
+                )
+            ),
+            sink.ready.eq(leave),
+        ]
+        self.sync += [
+            If(pushed & (push.count != 0), started.eq(1)),
+            If(issued, idx.eq(idx + 1)),
+            If(leave,
+                started.eq(0),
+                idx.eq(0),
+                If(started | (pushed & (push.count != 0)), rid.eq(rid + 1)),
+            ),
+            If(sink.valid & sink.ready & ~well, malformed.eq(malformed + 1)),
+        ]
+
+        # Answers: the words of the oldest request, then its response.
+        # --------------------------------------------------------------
+        tx_valid = Signal()
+        free     = Signal() # A response can be stored at the end of this cycle.
+        k        = Signal(4) # Answers of the request received.
+        good     = Signal(4) # Words done before the first error.
+        failed   = Signal()  # An access of the request ended with an error.
+        rdata    = [Signal(32, name=f"rdata{i}") for i in range(burst)]
+        waiting  = Signal()  # Oldest request waiting for answers.
+        mine     = Signal()  # Answer of the oldest request.
+        ahead    = Signal(4)
+        older    = Signal()
+        newer    = Signal()
+        take     = Signal()
+        last     = Signal()
+        respond  = Signal()
+        status   = Signal(4)
+        done     = Signal(4)
+        self.timer = timer = WaitTimer(timeout) # Watchdog.
+        self.comb += [
+            tx.valid.eq(tx_valid),
+            free.eq(~tx_valid | tx.ready),
+            waiting.eq(head.valid & (head.count != 0)),
+            ahead.eq(rsp.id - head.id),
+            mine.eq(waiting & rsp.valid & (ahead == 0)),
+            last.eq(k == (head.count - 1)),
+            # The memory answers in order. An answer of an older request is of a request that
+            # timed out: dropped. An answer of a newer request means that the missing answers of
+            # the oldest request will not come: it ends now. (The answers of the next requests
+            # wait for a refused request to be answered first.)
+            older.eq(waiting & rsp.valid & ahead[3]),
+            newer.eq(waiting & rsp.valid & (ahead != 0) & ~ahead[3]),
+            rsp.ready.eq((mine & (~last | free)) | older),
+            take.eq(mine & rsp.ready),
+            timer.wait.eq(waiting & ~take & ~respond),
+            status.eq(head.status),
+            done.eq(good),
+            If(head.valid & (head.count == 0),
+                respond.eq(free)
+            ).Elif(take & last,
+                respond.eq(1),
+                If(failed | rsp.err,
+                    status.eq(FABRIC_BUS)
+                ).Else(
+                    done.eq(good + 1)
+                )
+            ).Elif(waiting & (timer.done | newer) & free,
+                # An answer is missing: which words were done is not known.
+                respond.eq(1),
+                done.eq(0),
+                status.eq(Mux(failed, FABRIC_BUS, FABRIC_TIMEOUT)),
+                # The request may still be giving its accesses to the memory.
+                abort.eq(started & (rid == head.id)),
+            ),
+            head.ready.eq(respond),
+        ]
+        self.sync += [
+            If(tx.valid & tx.ready,
+                tx_valid.eq(0)
+            ),
+            If(take,
+                k.eq(k + 1),
+                *[If(k == w, rdata[w].eq(rsp.dat_r)) for w in range(burst)],
+                If(rsp.err,
+                    failed.eq(1)
+                ).Elif(~failed,
+                    good.eq(good + 1)
+                ),
+            ),
+            If(rsp.valid & rsp.ready & ~take, late.eq(late + 1)),
+            If(respond,
+                k.eq(0),
+                good.eq(0),
+                failed.eq(0),
+                tx_valid.eq(1),
+                tx.w0.eq(route_word(head.src, Constant(node_id, 8), max_hops, 1)),
+                tx.w1.eq(Cat(head.tag, status, head.we, Constant(0, 1), head.burst, Constant(0, 1),
+                    Mux(head.burst, done, 0))),
+                *[packet_words(tx)[2 + w].eq(Mux(k == w, Mux(take, rsp.dat_r, 0), rdata[w])) for w in range(burst)],
+                tx.len.eq(Mux(head.we, 2, Mux(head.burst, 2 + done, 3))),
+                requests.eq(requests + 1),
+            )
+        ]
+
 # Fabric Copy --------------------------------------------------------------------------------------
 
 class FabricCopy(LiteXModule):
@@ -1360,11 +1597,13 @@ class FabricNode(LiteXModule):
 
     ``ports[p].sink``/``ports[p].source``: packets from/to the neighbor of port p.
     ``requester.sink``/``requester.source``: requests and results. ``responder.mem``: memory window
-    of this node. ``routes``: {destination node: [cost of each port]} (see ``Topology.costs()``;
+    of this node (Wishbone), or with ``pipelined`` ``responder.cmd``/``responder.rsp`` (memory port, see
+    exiom/memory.py): the Responder then sends an access per cycle. ``routes``: {destination node: [cost of each port]} (see ``Topology.costs()``;
     None: point to point, everything to port 0). ``max_hops``: links a packet may cross (same on
     all the nodes): longest shortest path, plus the detours allowed around links that are down.
     """
     def __init__(self, node_id, size, ports=1, routes=None, max_hops=1, requests=8, read_only=False,
+        pipelined       = False,
         request_timeout = 4096,
         copy_timeout    = None,
         copy_window     = 4,
@@ -1404,7 +1643,9 @@ class FabricNode(LiteXModule):
             timeout      = request_timeout,
             copy_timeout = copy_timeout,
         )
-        self.responder = responder = FabricResponder(node_id,
+        # Memory of the node: Wishbone bus (``responder.mem``), or memory port accessed without
+        # waiting for the answers (``pipelined``: ``responder.cmd``/``responder.rsp``).
+        self.responder = responder = (FabricPipelinedResponder if pipelined else FabricResponder)(node_id,
             size         = size,
             max_hops     = max_hops,
             read_only    = read_only,
