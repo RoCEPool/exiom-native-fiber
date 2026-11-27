@@ -199,33 +199,39 @@ default; with 8 nodes of a fabric cabled for 16, the single cable between the tw
 link, two chassis of 8 nodes (16 nodes, 8 ports per node, 128-bit links). The nightly workflow
 publishes the full tables (per node: throughput as source and as destination, latency, Responder
 queue, packets forwarded; per link: packets) in its summary and as the `fabric-perf` artifact.
-Requests and words per 1000 cycles, whole fabric:
+Requests and words per 1000 cycles, whole fabric, with the two memories of a node: Wishbone
+(`FabricResponder`, one word every two cycles) and memory port (`FabricPipelinedResponder`, an
+access per cycle):
 
-| 8 requests in flight per node | Requests | Words | Average latency (cycles) | Busiest Responder (requests) | Busiest cable between chassis (packets) |
-|---|---|---|---|---|---|
-| Single words, to all the nodes        | 5464 | 5464 | 21  | 378 | 409 |
-| Bursts of 8 words, to all the nodes   | 764  | 6109 | 129 | 61  | 60  |
-| Bursts of 8 words, inside the chassis | 763  | 6105 | 125 | 61  | 0   |
-| Bursts of 8 words, all to node 0      | 82   | 658  | 711 | 62  | 26  |
+| 8 requests in flight per node | Words: Wishbone | Words: memory port | Average latency (cycles) | Busiest cable between chassis (packets) |
+|---|---|---|---|---|
+| Single words, to all the nodes        | 5464 | 5774  | 21 / 20   | 409 / 427 |
+| Bursts of 8 words, to all the nodes   | 6109 | 13663 | 129 / 66  | 60 / 133  |
+| Bursts of 8 words, inside the chassis | 6105 | 13247 | 125 / 65  | 0 / 0     |
+| Bursts of 8 words, all to node 0      | 658  | 1454  | 711 / 363 | 26 / 44   |
 
-| Copies of 64 words asked by every node | Words copied | Cycles per word | Busy retries |
-|---|---|---|---|
-| Sources all different, inside the chassis | 3606 | 4.4 | 0    |
-| Sources all different, to the other chassis | 3556 | 4.5 | 0  |
-| All from node 0                           | 324  | 33  | 1119 |
+| Copies of 64 words asked by every node | Words copied: Wishbone | Words copied: memory port | Cycles per word | Busy retries |
+|---|---|---|---|---|
+| Sources all different, inside the chassis   | 3606 | 6564 | 4.4 / 2.4 | 0 / 0      |
+| Sources all different, to the other chassis | 3556 | 6400 | 4.5 / 2.5 | 0 / 0      |
+| All from node 0                             | 324  | 500  | 33 / 23   | 1119 / 960 |
 
 What the numbers say, in the order the limits appear:
 
-1. **The Responder**: one memory word every two cycles, one request at a time. A node serves at
-   most 500 words per 1000 cycles whatever the traffic: bursts to all the nodes fill every
-   Responder (61 bursts of 8 words out of 62.5 possible, queues full); the hotspot is exactly one
-   Responder; a copy costs 4.4 cycles per word because the Responder of a node reads the words it
-   copies from and writes the words copied to it.
+1. **The Responder with a Wishbone memory**: one memory word every two cycles, one request at a
+   time. A node serves at most 500 words per 1000 cycles whatever the traffic: bursts to all the
+   nodes fill every Responder (61 bursts of 8 words out of 62.5 possible, queues full); the
+   hotspot is exactly one Responder; a copy costs 4.4 cycles per word because the Responder of a
+   node reads the words it copies from and writes the words copied to it. **With the memory
+   port** the Responder sends an access per cycle and does not wait for the answers: bursts and
+   copies about double (1000 words per 1000 cycles per node at most). Single words gain little:
+   their limit is the 8 requests in flight per node and the 20 cycles of a round trip.
 2. **One copy at a time per source node**: with one source for all, the node that copies is free
-   a third of the time between two copies (1119 retries), on top of limit 1.
+   between two copies (about 1000 retries); with the memory port it copies 500 words per 1000
+   cycles where its memory could give 1000.
 3. **The links are not the limit at this size**: traffic inside the chassis and traffic to all
-   the nodes give the same throughput; the busiest cable between the chassis carries 409 packets
-   per 1000 cycles with single words (a 128-bit link moves 1000) and 60 with bursts (3 cycles
+   the nodes give the same throughput; the busiest cable between the chassis carries 427 packets
+   per 1000 cycles with single words (a 128-bit link moves 1000) and 133 with bursts (3 cycles
    each). The single path per destination will matter with more chassis (72 pairs of nodes on the
    busiest cable at 128 nodes), which the simulator does not reach.
 
@@ -296,9 +302,11 @@ Cost (simulation, copy of 120 words, cycles per word from the copy request to it
 |---|---|---|
 | One request per word (before bursts) | 8.6 | 3.7 to 6.0 |
 | Bursts of 8 words | 2.6 | 2.4 |
+| Bursts of 8 words, nodes with the memory port | 2.3 | 1.5 |
 
-What limits it now: the Responders access the memory one word every two cycles (the source node
-to read, the destination node to write). The links are no longer the limit.
+With a Wishbone memory the limit is the Responders (one memory word every two cycles, at the
+source to read and at the destination to write). With the memory port (see Performance
+scenarios) a 32-bit link becomes the limit again (11 cycles for a burst of 8 words).
 
 ## Interfaces
 
@@ -315,6 +323,12 @@ to read, the destination node to write). The links are no longer the limit.
   access at a time.
 - `FabricPool(node, window_bits, chunk)`: reads, writes and copies with global addresses, one
   operation at a time.
+- Memory of a node: `responder.mem` (Wishbone master), or with `FabricNode(pipelined=True)` the
+  memory port `responder.cmd` / `responder.rsp` (`exiom/memory.py`): one word access per command,
+  answers in the order of the commands, like the native port of a memory controller.
+  `FabricMemory` puts a block RAM behind it, `FabricMemoryWishbone` a Wishbone slave. With the
+  memory port all the words of a burst are accessed even after an error in the burst, and a
+  request whose answers are missing reports no word done.
 
 ## Limits
 
@@ -324,7 +338,8 @@ to read, the destination node to write). The links are no longer the limit.
   requests can fail (see above).
 - At most 6 links on a path (12 classes per port, one flow control packet). Distances are 3-bit.
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
-- A Responder executes one request at a time, in two cycles (see Throughput).
+- A Responder with a Wishbone memory executes one request at a time, two cycles per word; with
+  the memory port, one word per cycle (see Performance scenarios).
 - Copies: one at a time per source node (see Copies and global addresses);
   no entry yet for a host to ask for a copy (the user of `FabricPool` is the test bench).
 
@@ -333,6 +348,7 @@ to read, the destination node to write). The links are no longer the limit.
 ```sh
 python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_network.py \
     test/test_fabric_copy.py test/test_fabric_burst.py test/test_fabric_address.py \
+    test/test_fabric_pipelined.py test/test_fabric_perf.py \
     test/test_fabric_bench.py test/test_fabric_sim.py
 ```
 
@@ -364,6 +380,10 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
 - `test_fabric_address.py`: two nodes with windows of 4 TiB (memory model: pattern of the address
   and the last words written): reads, writes and copies at addresses over 32 bits, end of the
   window, global addresses of 128 nodes of 4 TiB, copy from the end of a node to the next one.
+- `test_fabric_pipelined.py`: nodes with the memory port. The tests of the bursts, of the copies,
+  of the global addresses and of the 4-node networks run again with them; plus every status,
+  errors and missing answers with 8 requests in flight, a memory that stalls or stops taking
+  accesses, a Wishbone slave behind the port, and the rate (1 word per cycle against 0.5).
 - `test_fabric_perf.py`: performance scenarios (see above), with floors about 25 % under the
   rates measured.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
