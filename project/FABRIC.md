@@ -69,19 +69,24 @@ Paths left with one node down (`test_one_node_down`):
 
 ## Packet
 
-32-bit words, 2 to 4 words. The number of words follows from the kind of packet (write request:
-4, read request: 3, read response: 3, write response: 2); a port does not accept a packet that
-has another number of words.
+32-bit words, 2 to 6 words. The number of words follows from the kind of packet (write request:
+4, read request: 3, copy request: 6, read response: 3, write response: 2); a port does not accept
+a packet that has another number of words.
 
 Links carry `link_width` bits per cycle: 32 (one word per cycle, the SerWB link), 64 or 128 (a
-whole packet per cycle).
+whole packet of up to 4 words per cycle).
 
 | Word | Content |
 |------|---------|
 | 0 (route) | `[7:0]` destination node, `[15:8]` source node, `[18:16]` hop limit, `[23:19]` sequence number on the link, `[24]` response, `[25]` flow control, `[26]` routes, `[31:28]` magic |
-| 1 (transaction) | `[7:0]` tag, `[11:8]` byte enables (request) or status (response), `[12]` write, `[13]` copy, `[21:14]` node to copy to, `[31:22]` words to copy - 1 |
-| 2 | Word address in the destination window (request), read data or words copied (response) |
-| 3 | Write data (write request), word address to copy to (copy request) |
+| 1 (transaction) | `[7:0]` tag, `[11:8]` byte enables (request) or status (response), `[12]` write, `[13]` copy, `[31:16]` bits 47 to 32 of the word address (request) |
+| 2 | Bits 31 to 0 of the word address in the destination window (request), read data or words copied (response) |
+| 3 | Write data (write request), bits 31 to 0 of the word address to copy to (copy request) |
+| 4 | Copy request: `[7:0]` node to copy to, `[31:16]` bits 47 to 32 of the word address to copy to |
+| 5 | Copy request: words to copy - 1 |
+
+- Word addresses are 48-bit: a window can be up to 2^48 words of 4 bytes. A node of 4 TiB uses
+  40 bits; 128 nodes of 4 TiB are 512 TiB.
 
 - Word 0 is all a node needs to forward a packet. Up to 256 nodes.
 - Hop limit: links the packet may cross, decremented by each forwarding node.
@@ -206,7 +211,8 @@ like any request; switches and ports are not modified.
 - Timeout of a copy request: `copy_timeout` (default 32 x `request_timeout`).
 
 **Global addresses** (`exiom/pool.py`). The windows of the nodes seen as one address space: global
-word address = node x 2^`window_bits` + word in the window. The map is static and computed (every
+word address = node x 2^`window_bits` + word in the window (`window_bits` up to 48; 40 for nodes
+of 4 TiB). The map is static and computed (every
 node owns the same number of addresses): no table to keep consistent between the nodes. Which
 address holds what (allocation, migration, reclaim) stays with the software above.
 
@@ -253,7 +259,7 @@ several words and a direct read port for the copy engine are the next steps for 
 
 ```sh
 python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_network.py \
-    test/test_fabric_copy.py test/test_fabric_bench.py test/test_fabric_sim.py
+    test/test_fabric_copy.py test/test_fabric_address.py test/test_fabric_bench.py test/test_fabric_sim.py
 ```
 
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
@@ -276,6 +282,9 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   and source node cut off during a copy. Global addresses: reads and writes, copies longer than a
   copy request and going from a node to the next ones, copy running past the last node, two nodes
   asking the same source node.
+- `test_fabric_address.py`: two nodes with windows of 4 TiB (memory model: pattern of the address
+  and the last words written): reads, writes and copies at addresses over 32 bits, end of the
+  window, global addresses of 128 nodes of 4 TiB, copy from the end of a node to the next one.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
   with the bit-level generic PHYs, and 4-node networks with one hardware sequencer per node.
 - `test_fabric_sim.py`: the same benches with Verilator (runs in CI): two nodes bit-level, and

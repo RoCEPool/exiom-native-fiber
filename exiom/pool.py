@@ -7,8 +7,9 @@
 """
 Pool: the memory windows of the nodes of a fabric seen as one address space.
 
-Global address (words): [window_bits-1:0] word in the window of a node, [window_bits+7:
-window_bits] node. The map is static: every node owns the same number of addresses
+Global address (words of 4 bytes): [window_bits-1:0] word in the window of a node,
+[window_bits+7:window_bits] node. ``window_bits`` goes up to 48; 40 gives 4 TiB per node and a
+pool of 1 PiB for 256 nodes. The map is static: every node owns the same number of addresses
 (``2**window_bits`` words, at least the size of its window) and the node of an address is
 computed, not looked up: no table to keep consistent between the nodes. An address of a node that
 is not in the fabric ends with FABRIC_NODE, an address after the end of the window of its node
@@ -78,7 +79,7 @@ class FabricPool(LiteXModule):
     ``sink``: operation (taken when its result is given). ``source``: result.
     """
     def __init__(self, node, window_bits, chunk=256, busy_wait=64, busy_retries=1024):
-        assert 1 <= window_bits <= 32 and 1 <= chunk <= FABRIC_COPY_WORDS
+        assert 1 <= window_bits <= FABRIC_ADDRESS_BITS and 1 <= chunk <= FABRIC_COPY_WORDS
         self.window_bits = window_bits
         self.sink   = sink   = stream.Endpoint(pool_request_layout(window_bits))
         self.source = source = stream.Endpoint(pool_result_layout())
@@ -166,7 +167,7 @@ class FabricPool(LiteXModule):
             requester.sink.dst.eq(adr[window_bits:]),
             requester.sink.adr.eq(adr[:window_bits]),
             requester.sink.copy_dst.eq(dst_adr[window_bits:]),
-            requester.sink.dat_w.eq(dst_adr[:window_bits]),
+            requester.sink.copy_adr.eq(dst_adr[:window_bits]),
             requester.sink.words.eq(size),
             If(requester.sink.ready,
                 NextValue(tag, requester.tag),

@@ -52,10 +52,12 @@ def copy_request(node, src, adr, dst, dst_adr, words):
     yield sink.copy.eq(1)
     yield sink.copy_dst.eq(dst)
     yield sink.words.eq(words)
-    tag = yield from request(node, adr, dat_w=dst_adr, dst=src)
+    yield sink.copy_adr.eq(dst_adr)
+    tag = yield from request(node, adr, dst=src)
     yield sink.copy.eq(0)
     yield sink.copy_dst.eq(0)
     yield sink.words.eq(0)
+    yield sink.copy_adr.eq(0)
     return tag
 
 def copy(node, src, adr, dst, dst_adr, words):
