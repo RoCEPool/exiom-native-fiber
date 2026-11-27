@@ -29,6 +29,7 @@ from liteiclink.serwb.packet import packet_description
 
 from exiom.fabric  import *
 from exiom.network import FabricLossyLink
+from exiom.memory  import FabricMemory
 
 from test.test_serwb_link import LoopbackPHY, bus_access
 
@@ -104,24 +105,41 @@ class PacketFilter(LiteXModule):
             )
         ]
 
+# Memory of a node ---------------------------------------------------------------------------------
+
+class Defaults:
+    pipelined = False # Nodes with a memory port (FabricPipelinedResponder) instead of Wishbone.
+
+defaults = Defaults()
+
+def node_memory(node, pipelined, latency=0, slow_adr=None, slow_latency=0, hang_adr=None, err_adr=None):
+    """Memory of 256 words for a node, with a ``mem`` attribute (the words)."""
+    if pipelined:
+        assert slow_adr is None
+        return FabricMemory(node.responder.cmd, node.responder.rsp, 256, latency=1 + latency,
+            err_adr=err_adr, hang_adr=hang_adr)
+    return Memory(node.responder.mem, latency=latency, slow_adr=slow_adr, slow_latency=slow_latency,
+        hang_adr=hang_adr, err_adr=err_adr)
+
 # DUT ----------------------------------------------------------------------------------------------
 
 class DUT(LiteXModule):
     """Nodes A (id 1) and B (id 2), each with its memory."""
     def __init__(self, link="direct", size=128, requests=8, request_timeout=4096, buffer_depth=4,
         queue_depth=2, fc_period=64, read_only=False, memory_timeout=128, loss=0, link_width=32,
-        mem_kwargs={}):
+        mem_kwargs={}, pipelined=None):
         assert (link == "direct") or (link_width == 32)
         self.link_up = Signal(reset=1)
+        pipelined = defaults.pipelined if pipelined is None else pipelined
 
         # Nodes.
-        node_kwargs = dict(size=size, requests=requests, request_timeout=request_timeout,
+        node_kwargs = dict(pipelined=pipelined, size=size, requests=requests, request_timeout=request_timeout,
             memory_timeout=memory_timeout, buffer_depth=buffer_depth, queue_depth=queue_depth,
             fc_period=fc_period, read_only=read_only, link_width=link_width, link_ready=self.link_up)
         self.a = FabricNode(node_id=1, **node_kwargs)
         self.b = FabricNode(node_id=2, **node_kwargs)
-        self.a_mem = Memory(self.a.responder.mem, **mem_kwargs)
-        self.b_mem = Memory(self.b.responder.mem, **mem_kwargs)
+        self.a_mem = node_memory(self.a, pipelined, **mem_kwargs)
+        self.b_mem = node_memory(self.b, pipelined, **mem_kwargs)
 
         # Packet drops (data packet of index `x2y.drop` of the direction).
         a_source = stream.Endpoint(packet_description(link_width))

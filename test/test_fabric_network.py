@@ -26,7 +26,7 @@ from exiom.fabric   import *
 from exiom.topology import *
 from exiom.network  import *
 
-from test.test_fabric import Memory, request, result, results, write, read, wait
+from test.test_fabric import Memory, node_memory, defaults, request, result, results, write, read, wait
 from test.nightly     import nightly
 
 # After the other imports (run_simulation is also exported by litex.gen).
@@ -35,12 +35,13 @@ from test.fabric_sim import run_simulation # Same simulator, starts faster on la
 # DUT ----------------------------------------------------------------------------------------------
 
 class DUT(LiteXModule):
-    def __init__(self, topology, mem_kwargs={}, size=256, **kwargs):
+    def __init__(self, topology, mem_kwargs={}, size=256, pipelined=None, **kwargs):
         self.topology = topology
-        self.net  = FabricNetwork(topology, size=size, fc_period=64, **kwargs)
+        pipelined = defaults.pipelined if pipelined is None else pipelined
+        self.net  = FabricNetwork(topology, size=size, fc_period=64, pipelined=pipelined, **kwargs)
         self.mems = []
         for n, node in enumerate(self.net.nodes):
-            mem = Memory(node.responder.mem, **mem_kwargs)
+            mem = node_memory(node, pipelined, **mem_kwargs)
             self.add_module(f"mem{n}", mem)
             self.mems.append(mem)
         self.nodes = self.net.nodes
