@@ -157,6 +157,7 @@ class TestFabricBlockCache(unittest.TestCase):
             yield from fill(dut)
             res["too_big"]    = yield from command(dut, BLOCK_FETCH, slot=0, words=65, dst=1)
             res["bad_slot"]   = yield from command(dut, BLOCK_PUSH,  slot=4, words=8)
+            res["huge"]       = yield from command(dut, BLOCK_FETCH, slot=0, words=64 + 128, dst=1)
             res["fetched0"]   = (yield dut.cache.fetched)
             # Last 8 words of the window and 8 beyond it.
             res["past_end"]   = yield from command(dut, BLOCK_FETCH, slot=1, words=16, dst=1, adr=WINDOW//4 - 8)
@@ -166,12 +167,13 @@ class TestFabricBlockCache(unittest.TestCase):
             res["ok_after"]   = yield from command(dut, BLOCK_FETCH, slot=3, words=4, dst=1)
         run(dut, main)
         self.assertEqual(res["too_big"][:2],  (FABRIC_RANGE, 0))
-        self.assertEqual(res["bad_slot"][:2], (FABRIC_RANGE, 0))
+        self.assertEqual(res["bad_slot"][:2], (FABRIC_RANGE, 0), "slot 4 of 4: refused, not slot 0")
+        self.assertEqual(res["huge"][:2], (FABRIC_RANGE, 0), "192 words: refused, not 64")
         self.assertEqual(res["fetched0"], 0, "nothing moved")
         self.assertEqual(res["past_end"][0], FABRIC_RANGE)
         self.assertEqual(res["fetched1"], 8, "the 8 words inside the window")
         self.assertEqual(res["no_node"][0], FABRIC_NODE)
-        self.assertEqual(res["errors"], 4)
+        self.assertEqual(res["errors"], 5)
         self.assertEqual(res["ok_after"][:2], (FABRIC_OK, 4))
 
     def test_two_links_away_with_lost_packets(self):

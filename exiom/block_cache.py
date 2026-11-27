@@ -26,7 +26,8 @@ Commands (``cmd``), executed one at a time, in order:
 Completions (``done``): op, slot, status and the number of words moved. Status is FABRIC_OK, the
 first error of the reads of a FETCH (FABRIC_RANGE, FABRIC_NODE, FABRIC_NO_RESPONSE...: every read
 of the FETCH still completes, the slot then holds a partial block the host must not use), or
-FABRIC_RANGE for a command whose block does not fit in a slot (nothing is moved).
+FABRIC_RANGE for a command whose block does not fit in a slot or whose slot does not exist
+(nothing is moved).
 
 The module uses the Requester of ``node`` alone (not shared with other request sources).
 The on-board memory is modeled by a Migen Memory of ``slots * slot_words`` words (on a board:
@@ -62,8 +63,12 @@ def block_out_layout():
 class FabricBlockCache(LiteXModule):
     def __init__(self, node, slots, slot_words, inflight=8):
         assert slots >= 1 and slot_words >= 1 and inflight >= 1
-        slot_bits  = max(1, bits_for(slots - 1))
-        words_bits = bits_for(slot_words)
+        assert slots <= 2**16
+        # Slot fields are 16 bits whatever the number of slots: a slot number the host got wrong
+        # is refused (FABRIC_RANGE), not truncated into another slot.
+        assert slot_words < 2**16
+        slot_bits  = 16
+        words_bits = 17 # Same for block lengths: a block longer than a slot is refused, not truncated.
         self.slots      = slots
         self.slot_words = slot_words
 
