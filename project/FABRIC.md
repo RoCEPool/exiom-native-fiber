@@ -43,6 +43,31 @@ With 8 nodes of a fabric cabled for 16, the two groups are connected by one cabl
 `exiom/topology.py` builds the topology (`two_tier()`, and `hypercube()` to check that nothing
 depends on the topology) and the route tables at reset.
 
+### Chassis of 8 nodes, up to 128 nodes
+
+The same rule with `group_size=8`: one chassis of 8 nodes is one group (7 ports per node inside
+the chassis), the chassis are cabled together with `inter_ports` more ports per node. Computed by
+`exiom/topology.py` (`test_topology.py::test_chassis_of_8`), shortest paths, every node sending as
+much to every other node:
+
+| Nodes (chassis) | Ports per node | Cables | Links between two nodes: most / average | Most with one node down | Busiest link (pairs of nodes) |
+|---|---|---|---|---|---|
+| 16 (2)   | 8  | 64  | 2 / 1.47 | 2 | 8  |
+| 32 (4)   | 8  | 126 | 3 / 2.14 | 3 | 38 |
+| 32 (4)   | 10 | 160 | 2 / 1.68 | 2 | 8  |
+| 128 (16) | 9  | 568 | 3 / 2.65 | 4 | 72 |
+| 128 (16) | 11 | 688 | 3 / 2.42 | 3 | 64 |
+
+- Two nodes of the same chassis are always one link apart. The busiest links are the cables
+  between the chassis; a link inside a chassis carries at most 34 to 38 pairs at 128 nodes.
+- A design of D chassis needs `8 x inter_ports >= D - 1` (a cable between any two chassis):
+  `two_tier()` refuses fewer ports. 16 chassis need 2 inter-chassis ports per node.
+- Node numbers are 8-bit (256 nodes), the hop limit is 6: 128 nodes fit, with one node down too.
+- A fabric cabled for 16 chassis works with 2, 4 and 8 chassis installed; adding chassis only
+  adds cables.
+- Verified for 128 nodes: topology, routes, paths with a node down (model in Python). Not
+  simulated at the packet level (see Verification for the sizes simulated).
+
 ## Routes: following the state of the fabric
 
 - Each node keeps, per destination, the cost of each of its ports: the links to the destination
@@ -276,7 +301,8 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
 ```
 
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
-  with any one node down.
+  with any one node down; chassis of 8 nodes up to 128 nodes (cables, longest paths, busiest
+  link, a node down, growth from 2 to 16 chassis, too few inter-chassis ports refused).
 - `test_fabric.py`: two nodes, connected directly and through SerWB (word-level PHY model):
   requests in flight, queueing, both directions, errors isolated to their request,
   late response, link down (with a sweep of the moment the link is lost), backpressure with the
@@ -310,7 +336,13 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   simulator.
 
 `test/fabric_sim.py` runs the Migen simulator with a faster equivalent of its statement grouping
-(the original takes minutes to start on 8 nodes and more).
+(the original takes minutes to start on 8 nodes and more), and makes Migen number the objects of
+a design without searching them (same names; building 16 nodes of 8 ports: 51 s to 7 s).
+
+Sizes simulated at the packet level: up to 16 nodes. With chassis of 8 nodes (8 ports per node),
+16 nodes take about 50 ms per cycle in the Migen simulator; 32 nodes did not finish a few hundred
+cycles in 9 minutes, and building 128 nodes runs out of memory. 128 nodes are verified by the
+topology model only.
 
 Every push and pull request runs the tests that cover each feature at a small scale (2 and 4
 nodes, 8 nodes for forwarding over 3 links). The longest simulations (8 and 16 nodes with a node

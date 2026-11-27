@@ -92,6 +92,61 @@ class TestTopology(unittest.TestCase):
                                 self.assertEqual(status == FABRIC_OK, d is not None)
                 self.assertEqual((served, worst), (all_served, longest))
 
+    def test_chassis_of_8(self):
+        # Groups of 8 nodes (one chassis each, 7 ports inside the chassis):
+        # nodes: (design groups, inter ports, cables, max hops, busiest link (pairs), max hops with
+        # one node down).
+        for nodes, (groups, inter, cables, hops, busiest, hops_down) in {
+            16  : (2,  1,  64, 2,  8, 2),
+            32  : (4,  1, 126, 3, 38, 3),
+            64  : (8,  1, 252, 3, None, None),
+            128 : (16, 2, 568, 3, 72, 4),
+        }.items():
+            with self.subTest(nodes=nodes):
+                t = two_tier(nodes, group_size=8, design_groups=groups, inter_ports=inter)
+                self.assertEqual(t.ports, 7 + inter)
+                self.assertEqual(len(t.links), cables)
+                distances = t.distances()
+                self.assertTrue(all(len(distances[n]) == nodes for n in range(nodes))) # All reachable.
+                self.assertEqual(max(max(d.values()) for d in distances.values()), hops)
+                self.assertLessEqual(hops + 2, 6) # Hop limit of the packets, with detours.
+                # Inside a chassis: always one link.
+                self.assertTrue(all(distances[n][m] == 1 for n in range(8) for m in range(8) if n != m))
+                if busiest is not None:
+                    loads = t.loads()
+                    self.assertEqual(sum(loads.values()), sum(sum(d.values()) for d in distances.values()))
+                    self.assertEqual(max(loads.values()), busiest)
+                    # The busiest links are between the chassis.
+                    self.assertGreaterEqual(max(loads, key=loads.get)[1], 7)
+                if hops_down is not None:
+                    worst = 0
+                    for down in range(0, nodes, max(1, nodes//32)):
+                        d = t.distances(down=[down])
+                        for src in range(nodes):
+                            if src != down:
+                                self.assertEqual(len(d[src]), nodes - 1, (down, src)) # Nobody else lost.
+                                worst = max(worst, max(d[src].values()))
+                    self.assertEqual(worst, hops_down)
+                    self.assertLessEqual(worst, 6)
+
+    def test_chassis_of_8_growth(self):
+        # Cabled for 16 chassis: 2 -> 4 -> 8 -> 16 chassis only adds cables, and every size works.
+        previous = set()
+        for nodes in [16, 32, 64, 128]:
+            t = two_tier(nodes, group_size=8, design_groups=16, inter_ports=2)
+            links = set(t.links)
+            self.assertTrue(previous <= links)
+            previous = links
+            distances = t.distances()
+            self.assertTrue(all(len(distances[n]) == nodes for n in range(nodes)), nodes)
+            self.assertLessEqual(max(max(d.values()) for d in distances.values()), 4)
+
+    def test_too_few_inter_ports(self):
+        # 16 chassis of 8 with one inter-chassis port per node: 8 cables for 15 other chassis.
+        with self.assertRaises(ValueError):
+            two_tier(128, group_size=8, design_groups=16, inter_ports=1)
+        two_tier(128, group_size=8, design_groups=16, inter_ports=2)
+
     def test_costs(self):
         # Cost of a port: links to the destination through it, without coming back.
         t = two_tier(4)
