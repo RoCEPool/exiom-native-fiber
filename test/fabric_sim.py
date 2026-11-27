@@ -17,9 +17,33 @@ same statements order inside a group), in time proportional to the number of sta
 simulator itself is not modified; if it stops using this function, simulations just start slower.
 """
 
+from migen.fhdl import tracer as _tracer
 from migen.fhdl.tools import list_targets, flat_iteration
 
 import litex.gen.sim.core as _core
+
+# Building the design. Migen numbers the objects of a class by searching each new one in the list
+# of all the objects of its class, for every Signal created (most of the time to build a fabric of
+# 16 nodes). Same numbers here, remembered instead of searched (the lists only grow). Import this
+# module before building.
+_indexes = {} # id(list) -> [list, {id(object): index}, objects indexed].
+
+def index_id(l, obj):
+    entry = _indexes.get(id(l))
+    if entry is None or entry[0] is not l:
+        entry = _indexes[id(l)] = [l, {}, 0]
+    _, index, done = entry
+    if done < len(l):
+        for n in range(done, len(l)):
+            index.setdefault(id(l[n]), n)
+        entry[2] = len(l)
+    try:
+        return index[id(obj)]
+    except KeyError:
+        raise ValueError
+
+if hasattr(_tracer, "index_id"):
+    _tracer.index_id = index_id
 
 def group_by_targets(sl):
     """Groups of statements sharing targets: [(targets, statements)], as migen.fhdl.tools."""

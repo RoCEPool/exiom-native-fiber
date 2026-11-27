@@ -98,6 +98,23 @@ class Topology:
                 hops[(src, dst)] = count if (count is None or count <= self.nodes) else None
         return hops
 
+    def loads(self, routes=None):
+        """{(node, port): pairs (source, destination) whose route leaves ``node`` by ``port``}:
+        load of each direction of each link when every node sends as much to every other node."""
+        routes = self.routes() if routes is None else routes
+        loads  = {port: 0 for port in self.peers}
+        for src in range(self.nodes):
+            for dst in routes[src]:
+                node, count = src, 0
+                while node != dst and count <= self.nodes:
+                    port = routes[node].get(dst)
+                    if port is None:
+                        break
+                    loads[(node, port)] += 1
+                    node   = self.peers[(node, port)][0]
+                    count += 1
+        return loads
+
     def max_hops(self, routes=None):
         hops = [h for h in self.hops(routes).values() if h is not None]
         return max(hops) if hops else 1
@@ -155,6 +172,11 @@ def two_tier(nodes, group_size=4, design_groups=4, inter_ports=1):
     """
     assert nodes >= 1 and group_size >= 1 and design_groups >= 1
     assert nodes <= group_size*design_groups, "More nodes than the fabric is designed for."
+    if group_size*inter_ports < design_groups - 1:
+        # Fewer cables leaving a group than other groups: some groups would have no cable between
+        # them, and with the cabling rule below most of them would not be connected at all.
+        raise ValueError(f"{design_groups} groups of {group_size} nodes need at least "
+            f"{-(-(design_groups - 1)//group_size)} inter-group ports per node (inter_ports={inter_ports}).")
     links = []
     def present(node):
         return node < nodes
