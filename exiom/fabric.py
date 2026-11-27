@@ -85,10 +85,10 @@ Semantics:
 - FABRIC_NO_RESPONSE and FABRIC_LINK mean "not confirmed": the request may have been executed.
 - Copy (``FabricCopy``): the node that receives a copy request reads the words in its own window
   and writes them in the window of the node to copy to, with its own requests: the data goes
-  straight from the source node to the destination node, not through the node that asked. One copy
-  at a time per source node: a copy request received during another one is refused at once with
-  FABRIC_BUSY (it never waits in the Responder, so two nodes copying to each other cannot wait for
-  each other). The response gives the first error and the number of words written; statuses 8 and
+  straight from the source node to the destination node, not through the node that asked. A node
+  runs ``copy_lanes`` copies at a time: a copy request received while they are all running is
+  refused at once with FABRIC_BUSY (it never waits in the Responder, so two nodes copying to each
+  other cannot wait for each other). The response gives the first error and the number of words written; statuses 8 and
   9 in a copy response are those of the requests of the source node (not confirmed).
 - Packets lost on a link are sent again by the link. Packets in a node or on a link that goes
   down are lost, and while this change spreads in the fabric (a few route packet periods),
@@ -1004,11 +1004,11 @@ class FabricPipelinedResponder(LiteXModule):
 
 # Fabric Copy --------------------------------------------------------------------------------------
 
-class FabricCopy(LiteXModule):
-    """Runs the copies asked to this node: reads the words in the window of the node and writes
-    them in the window of the destination node, by bursts, ``window`` bursts at a time.
+class FabricCopyLane(LiteXModule):
+    """Runs one copy at a time: reads the words in the window of the node and writes them in the
+    window of the destination node, by bursts, ``window`` bursts at a time.
 
-    ``cmd``: copy to run (from the Responder; one at a time). ``sink``/``source``/``tag``: requests
+    ``cmd``: copy to run (ready when the lane is free). ``sink``/``source``/``tag``: requests
     and results (``copy_sink``/``copy_source``/``tag`` of the Requester): the words are read with
     burst requests to this node itself and written with burst requests to the destination node.
     ``tx``: response to the node that asked the copy (status: first error, word 2: words written).
@@ -1165,6 +1165,82 @@ class FabricCopy(LiteXModule):
                 tx.len.eq(3),
                 If(failed, errors.eq(errors + 1)),
             ),
+        ]
+
+class FabricCopy(LiteXModule):
+    """Runs the copies asked to this node, ``lanes`` at a time (``FabricCopyLane``).
+
+    ``cmd``: copy to run (from the Responder; ready while a lane is free). ``sink``/``source``/
+    ``tag``: requests and results of all the lanes (``copy_sink``/``copy_source``/``tag`` of the
+    Requester; the lanes are served in turn and share its slots). ``tx``: responses to the nodes
+    that asked the copies.
+    """
+    def __init__(self, node_id, max_hops=1, window=4, lanes=1):
+        assert lanes >= 1
+        self.cmd    = cmd    = stream.Endpoint(copy_layout())
+        self.sink   = sink   = stream.Endpoint(request_layout())
+        self.source = source = stream.Endpoint(result_layout())
+        self.tag    = tag    = Signal(8)
+        self.tx     = tx     = stream.Endpoint(fabric_packet_layout())
+
+        # Status.
+        self.copies = copies = Signal(32) # Copies run.
+        self.words  = words  = Signal(32) # Words written.
+        self.errors = errors = Signal(32) # Copies ended by an error.
+        self.busy   = busy   = Signal(max=lanes + 1) # Copies running.
+
+        # # #
+
+        self.lanes = units = []
+        for i in range(lanes):
+            lane = FabricCopyLane(node_id, max_hops=max_hops, window=window)
+            self.add_module(f"lane{i}", lane)
+            units.append(lane)
+
+        # Copy: to the first free lane.
+        given = Constant(0, 1)
+        for lane in units:
+            self.comb += [
+                cmd.connect(lane.cmd, omit={"valid", "ready"}),
+                lane.cmd.valid.eq(cmd.valid & ~given),
+            ]
+            given = given | lane.cmd.ready
+        self.comb += [
+            cmd.ready.eq(given),
+            busy.eq(sum(~lane.cmd.ready for lane in units)),
+        ]
+
+        # Requests: the lanes in turn. Results: to all the lanes (each one knows its tags).
+        turn = Signal(max=max(2, lanes))
+        pick = Signal(max=max(2, lanes))
+        some = Signal()
+        for offset in reversed(range(lanes)):
+            for i in range(lanes):
+                self.comb += If((turn == i) & units[(i + offset) % lanes].sink.valid,
+                    pick.eq((i + offset) % lanes),
+                    some.eq(1),
+                )
+        for i, lane in enumerate(units):
+            self.comb += [
+                If(some & (pick == i), lane.sink.connect(sink)),
+                lane.tag.eq(tag),
+                source.connect(lane.source, omit={"ready"}),
+            ]
+        self.comb += source.ready.eq(1)
+        self.sync += If(sink.valid & sink.ready, turn.eq(Mux(pick == lanes - 1, 0, pick + 1)))
+
+        # Responses: first lane that has one.
+        sending = Constant(0, 1)
+        for lane in units:
+            self.comb += If(lane.tx.valid & ~sending, lane.tx.connect(tx))
+            sending = sending | lane.tx.valid
+
+        self.sync += [
+            copies.eq(copies + sum(lane.cmd.valid & lane.cmd.ready for lane in units)),
+        ]
+        self.comb += [
+            words.eq(sum(lane.words for lane in units)),
+            errors.eq(sum(lane.errors for lane in units)),
         ]
 
 # Fabric Port --------------------------------------------------------------------------------------
@@ -1607,6 +1683,7 @@ class FabricNode(LiteXModule):
         request_timeout = 4096,
         copy_timeout    = None,
         copy_window     = 4,
+        copy_lanes      = 2,
         memory_timeout  = 1024,
         buffer_depth    = 4,
         queue_depth     = 4,
@@ -1653,7 +1730,8 @@ class FabricNode(LiteXModule):
             buffer_depth = buffer_depth,
         )
         # Copies asked to this node: taken from the Responder, run with requests of the Requester.
-        self.copy = copy = FabricCopy(node_id, max_hops=max_hops, window=min(copy_window, requests))
+        self.copy = copy = FabricCopy(node_id, max_hops=max_hops, window=min(copy_window, requests),
+            lanes=copy_lanes)
         self.comb += [
             responder.copy.connect(copy.cmd),
             copy.sink.connect(requester.copy_sink),
