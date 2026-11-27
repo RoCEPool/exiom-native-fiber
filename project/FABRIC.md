@@ -193,6 +193,42 @@ Bounds now: a Responder executes a request every two cycles (500 requests per 10
 destination node, reached with 3 nodes writing one); a Requester has 8 requests in flight by
 default; with 8 nodes of a fabric cabled for 16, the single cable between the two groups.
 
+## Performance scenarios: where the limit is
+
+`test/test_fabric_perf.py` (nightly; a 4-node version on every push) measures, per node and per
+link, two chassis of 8 nodes (16 nodes, 8 ports per node, 128-bit links). The nightly workflow
+publishes the full tables (per node: throughput as source and as destination, latency, Responder
+queue, packets forwarded; per link: packets) in its summary and as the `fabric-perf` artifact.
+Requests and words per 1000 cycles, whole fabric:
+
+| 8 requests in flight per node | Requests | Words | Average latency (cycles) | Busiest Responder (requests) | Busiest cable between chassis (packets) |
+|---|---|---|---|---|---|
+| Single words, to all the nodes        | 5464 | 5464 | 21  | 378 | 409 |
+| Bursts of 8 words, to all the nodes   | 764  | 6109 | 129 | 61  | 60  |
+| Bursts of 8 words, inside the chassis | 763  | 6105 | 125 | 61  | 0   |
+| Bursts of 8 words, all to node 0      | 82   | 658  | 711 | 62  | 26  |
+
+| Copies of 64 words asked by every node | Words copied | Cycles per word | Busy retries |
+|---|---|---|---|
+| Sources all different, inside the chassis | 3606 | 4.4 | 0    |
+| Sources all different, to the other chassis | 3556 | 4.5 | 0  |
+| All from node 0                           | 324  | 33  | 1119 |
+
+What the numbers say, in the order the limits appear:
+
+1. **The Responder**: one memory word every two cycles, one request at a time. A node serves at
+   most 500 words per 1000 cycles whatever the traffic: bursts to all the nodes fill every
+   Responder (61 bursts of 8 words out of 62.5 possible, queues full); the hotspot is exactly one
+   Responder; a copy costs 4.4 cycles per word because the Responder of a node reads the words it
+   copies from and writes the words copied to it.
+2. **One copy at a time per source node**: with one source for all, the node that copies is free
+   a third of the time between two copies (1119 retries), on top of limit 1.
+3. **The links are not the limit at this size**: traffic inside the chassis and traffic to all
+   the nodes give the same throughput; the busiest cable between the chassis carries 409 packets
+   per 1000 cycles with single words (a 128-bit link moves 1000) and 60 with bursts (3 cycles
+   each). The single path per destination will matter with more chassis (72 pairs of nodes on the
+   busiest cable at 128 nodes), which the simulator does not reach.
+
 ## Semantics
 
 - Every request gets exactly one result, identified by its tag. A failed request only fails
@@ -328,6 +364,8 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
 - `test_fabric_address.py`: two nodes with windows of 4 TiB (memory model: pattern of the address
   and the last words written): reads, writes and copies at addresses over 32 bits, end of the
   window, global addresses of 128 nodes of 4 TiB, copy from the end of a node to the next one.
+- `test_fabric_perf.py`: performance scenarios (see above), with floors about 25 % under the
+  rates measured.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
   with the bit-level generic PHYs, and 4-node networks with one hardware sequencer per node.
 - `test_fabric_sim.py`: the same benches with Verilator (runs in CI): two nodes bit-level, and
