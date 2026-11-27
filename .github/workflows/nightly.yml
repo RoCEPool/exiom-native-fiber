@@ -76,3 +76,20 @@ jobs:
         env:
           EXIOM_NIGHTLY: "1"
         run: python3 -m pytest -v --durations=15
+
+      # Throughput and queueing per node of the performance scenarios (test/test_fabric_perf.py).
+      - name: Performance report
+        if: always()
+        run: |
+          if [ -f build/fabric_perf.md ]; then
+            cat build/fabric_perf.md
+            cat build/fabric_perf.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabric-perf
+          path: build/fabric_perf.md
+          if-no-files-found: ignore
