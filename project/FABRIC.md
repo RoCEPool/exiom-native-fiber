@@ -79,9 +79,9 @@ whole packet per cycle).
 | Word | Content |
 |------|---------|
 | 0 (route) | `[7:0]` destination node, `[15:8]` source node, `[18:16]` hop limit, `[23:19]` sequence number on the link, `[24]` response, `[25]` flow control, `[26]` routes, `[31:28]` magic |
-| 1 (transaction) | `[7:0]` tag, `[11:8]` byte enables (request) or status (response), `[12]` write |
-| 2 | Word address in the destination window (request), read data (response) |
-| 3 | Write data (write request) |
+| 1 (transaction) | `[7:0]` tag, `[11:8]` byte enables (request) or status (response), `[12]` write, `[13]` copy, `[21:14]` node to copy to, `[31:22]` words to copy - 1 |
+| 2 | Word address in the destination window (request), read data or words copied (response) |
+| 3 | Write data (write request), word address to copy to (copy request) |
 
 - Word 0 is all a node needs to forward a packet. Up to 256 nodes.
 - Hop limit: links the packet may cross, decremented by each forwarding node.
@@ -183,6 +183,44 @@ that cannot be reached are answered with `FABRIC_NODE`, all the others are serve
 that are left. Requests in flight through the link when it goes down, or sent before the routes
 have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
 
+## Copies and global addresses
+
+**Copy request.** A request can ask a node to copy up to 1024 words of its window to the window
+of another node (`copy`, `copy_dst`, `words` of `requester.sink`; on the wire: a write request
+with the copy bit, answered like a read with the number of words written). The node that receives
+it (`FabricCopy`) reads the words in its own window and writes them to the destination node with
+its own requests, `copy_window` words in flight (default 4): the data goes straight from the
+source node to the destination node, whichever node asked. The other nodes forward a copy request
+like any request; switches and ports are not modified.
+
+- One copy at a time per source node. A copy request received during another one is refused at
+  once with `FABRIC_BUSY`: it never waits in the Responder, so nodes copying to each other cannot
+  wait for each other, and the Responder keeps serving the other requests during a copy.
+- The requests of a copy share the slots of the Requester of the source node with the requests
+  of its user, served in turn.
+- Result: first error and words written. Source words outside the window: `FABRIC_RANGE`, nothing
+  copied. Error on the way (destination window, node that cannot be reached, memory error): no
+  more word is read, the words already written stay. Statuses 8 and 9 in a copy result are those
+  of the requests of the source node ("not confirmed").
+- Words are not written in order: source and destination must not overlap.
+- Timeout of a copy request: `copy_timeout` (default 32 x `request_timeout`).
+
+**Global addresses** (`exiom/pool.py`). The windows of the nodes seen as one address space: global
+word address = node x 2^`window_bits` + word in the window. The map is static and computed (every
+node owns the same number of addresses): no table to keep consistent between the nodes. Which
+address holds what (allocation, migration, reclaim) stays with the software above.
+
+`FabricPool(node, window_bits, chunk)` takes one operation at a time with global addresses:
+`POOL_READ`, `POOL_WRITE` (one word), and `POOL_COPY` (`words` words from `adr` to `dst_adr`,
+wherever they are). A copy is cut in copy requests of at most `chunk` words, each inside the
+window of one source node and one destination node, so a copy can start in a node and go on in
+the next ones; a source node that is busy is asked again (`busy_wait`, `busy_retries`).
+
+Cost today (simulation, 128-bit links): 3.7 cycles per word with 8 words in flight, 6 with 4
+(8.6 on 32-bit links): every word is one request read by the Responder of the source node and one
+request written by the Responder of the destination node, two cycles each. Packets carrying
+several words and a direct read port for the copy engine are the next steps for throughput.
+
 ## Interfaces
 
 - `FabricNode(node_id, size, ports, routes, max_hops, ...)`: one node (`routes`: costs at reset,
@@ -196,6 +234,8 @@ have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
 - `FabricNetwork(topology, size, ...)`: the nodes of a topology and their links.
 - `FabricWishbone(node, dst, size, origin)`: Wishbone slave on the window of one remote node, one
   access at a time.
+- `FabricPool(node, window_bits, chunk)`: reads, writes and copies with global addresses, one
+  operation at a time.
 
 ## Limits
 
@@ -206,12 +246,14 @@ have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
 - At most 6 links on a path (12 classes per port, one flow control packet). Distances are 3-bit.
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
 - A Responder executes one request at a time, in two cycles (see Throughput).
+- Copies: one at a time per source node, one word per request (see Copies and global addresses);
+  no entry yet for a host to ask for a copy (the user of `FabricPool` is the test bench).
 
 ## Verification
 
 ```sh
 python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_network.py \
-    test/test_fabric_bench.py test/test_fabric_sim.py
+    test/test_fabric_copy.py test/test_fabric_bench.py test/test_fabric_sim.py
 ```
 
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
@@ -226,6 +268,14 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   and 16 nodes: all nodes to all nodes, random traffic checked against a model, hotspot, node cut
   and back, cable cut and back (requests go around), smallest buffers, route packets in several
   parts, and 4 and 8 nodes with one packet out of 10 lost on every link.
+- `test_fabric_copy.py`: 2 and 4 nodes. Copies asked by a third node, by the source, by the
+  destination and inside one node (the node that asked executes and forwards nothing); errors
+  (source and destination out of the window, nodes that do not exist, memory that does not answer
+  or answers with an error); second copy refused while one runs; every node copying to the next
+  one at the same time; copies with the other traffic; packets lost on every link; destination
+  and source node cut off during a copy. Global addresses: reads and writes, copies longer than a
+  copy request and going from a node to the next ones, copy running past the last node, two nodes
+  asking the same source node.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
   with the bit-level generic PHYs, and 4-node networks with one hardware sequencer per node.
 - `test_fabric_sim.py`: the same benches with Verilator (runs in CI): two nodes bit-level, and
