@@ -69,22 +69,28 @@ Paths left with one node down (`test_one_node_down`):
 
 ## Packet
 
-32-bit words, 2 to 6 words. The number of words follows from the kind of packet (write request:
-4, read request: 3, copy request: 6, read response: 3, write response: 2); a port does not accept
-a packet that has another number of words.
+32-bit words, 2 to 11 words. The number of words follows from the first two words of the packet
+(write request: 4, read request: 3, copy request: 6, read response: 3, write response: 2; burst
+write request: 3 + words, burst read response: 2 + words); a port does not accept a packet that
+has another number of words.
 
 Links carry `link_width` bits per cycle: 32 (one word per cycle, the SerWB link), 64 or 128 (a
-whole packet of up to 4 words per cycle).
+whole packet of up to 4 words per cycle; a burst of 8 words takes 3 cycles).
 
 | Word | Content |
 |------|---------|
 | 0 (route) | `[7:0]` destination node, `[15:8]` source node, `[18:16]` hop limit, `[23:19]` sequence number on the link, `[24]` response, `[25]` flow control, `[26]` routes, `[31:28]` magic |
-| 1 (transaction) | `[7:0]` tag, `[11:8]` byte enables (request) or status (response), `[12]` write, `[13]` copy, `[31:16]` bits 47 to 32 of the word address (request) |
+| 1 (transaction) | `[7:0]` tag, `[11:8]` byte enables or words of the burst - 1 (request), status (response), `[12]` write, `[13]` copy, `[14]` burst, `[31:16]` bits 47 to 32 of the word address (request), `[19:16]` words done (burst response) |
 | 2 | Bits 31 to 0 of the word address in the destination window (request), read data or words copied (response) |
-| 3 | Write data (write request), bits 31 to 0 of the word address to copy to (copy request) |
+| 3 | Write data (write request; a burst goes on in the next words), bits 31 to 0 of the word address to copy to (copy request) |
 | 4 | Copy request: `[7:0]` node to copy to, `[31:16]` bits 47 to 32 of the word address to copy to |
 | 5 | Copy request: words to copy - 1 |
 
+- Burst: 1 to 8 consecutive words (`FABRIC_BURST_WORDS`) read or written by one request (`burst`,
+  `count`, `data` of `requester.sink`; `count` and `data` of the result). The words are accessed
+  one after the other until the first error; the response gives the number of words done. A write
+  burst of 8 words carries 256 bits of data in 11 words (73 % of the packet, 25 % for a single
+  write).
 - Word addresses are 48-bit: a window can be up to 2^48 words of 4 bytes. A node of 4 TiB uses
   40 bits; 128 nodes of 4 TiB are 512 TiB.
 
@@ -190,11 +196,11 @@ have followed, can end with `FABRIC_NODE` or `FABRIC_NO_RESPONSE`.
 
 ## Copies and global addresses
 
-**Copy request.** A request can ask a node to copy up to 1024 words of its window to the window
+**Copy request.** A request can ask a node to copy up to 65536 words (256 KiB) of its window to the window
 of another node (`copy`, `copy_dst`, `words` of `requester.sink`; on the wire: a write request
 with the copy bit, answered like a read with the number of words written). The node that receives
 it (`FabricCopy`) reads the words in its own window and writes them to the destination node with
-its own requests, `copy_window` words in flight (default 4): the data goes straight from the
+its own burst requests, `copy_window` bursts in flight (default 4): the data goes straight from the
 source node to the destination node, whichever node asked. The other nodes forward a copy request
 like any request; switches and ports are not modified.
 
@@ -207,8 +213,9 @@ like any request; switches and ports are not modified.
   copied. Error on the way (destination window, node that cannot be reached, memory error): no
   more word is read, the words already written stay. Statuses 8 and 9 in a copy result are those
   of the requests of the source node ("not confirmed").
-- Words are not written in order: source and destination must not overlap.
-- Timeout of a copy request: `copy_timeout` (default 32 x `request_timeout`).
+- Bursts are not written in order: source and destination must not overlap.
+- Timeout of a copy request: `copy_timeout` (default 32 x `request_timeout`) plus 8 cycles per
+  word to copy.
 
 **Global addresses** (`exiom/pool.py`). The windows of the nodes seen as one address space: global
 word address = node x 2^`window_bits` + word in the window (`window_bits` up to 48; 40 for nodes
@@ -222,10 +229,15 @@ wherever they are). A copy is cut in copy requests of at most `chunk` words, eac
 window of one source node and one destination node, so a copy can start in a node and go on in
 the next ones; a source node that is busy is asked again (`busy_wait`, `busy_retries`).
 
-Cost today (simulation, 128-bit links): 3.7 cycles per word with 8 words in flight, 6 with 4
-(8.6 on 32-bit links): every word is one request read by the Responder of the source node and one
-request written by the Responder of the destination node, two cycles each. Packets carrying
-several words and a direct read port for the copy engine are the next steps for throughput.
+Cost (simulation, copy of 120 words, cycles per word from the copy request to its result):
+
+| | 32-bit links | 128-bit links |
+|---|---|---|
+| One request per word (before bursts) | 8.6 | 3.7 to 6.0 |
+| Bursts of 8 words | 2.6 | 2.4 |
+
+What limits it now: the Responders access the memory one word every two cycles (the source node
+to read, the destination node to write). The links are no longer the limit.
 
 ## Interfaces
 
@@ -252,14 +264,15 @@ several words and a direct read port for the copy engine are the next steps for 
 - At most 6 links on a path (12 classes per port, one flow control packet). Distances are 3-bit.
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
 - A Responder executes one request at a time, in two cycles (see Throughput).
-- Copies: one at a time per source node, one word per request (see Copies and global addresses);
+- Copies: one at a time per source node (see Copies and global addresses);
   no entry yet for a host to ask for a copy (the user of `FabricPool` is the test bench).
 
 ## Verification
 
 ```sh
 python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_network.py \
-    test/test_fabric_copy.py test/test_fabric_address.py test/test_fabric_bench.py test/test_fabric_sim.py
+    test/test_fabric_copy.py test/test_fabric_burst.py test/test_fabric_address.py \
+    test/test_fabric_bench.py test/test_fabric_sim.py
 ```
 
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
@@ -282,6 +295,10 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   and source node cut off during a copy. Global addresses: reads and writes, copies longer than a
   copy request and going from a node to the next ones, copy running past the last node, two nodes
   asking the same source node.
+- `test_fabric_burst.py`: bursts of every size on 32, 64 and 128-bit links and through SerWB, to
+  the other node and to the node itself; errors (out of the window, read-only, memory error or no
+  answer in the middle: words before done, words after not); sizes that are not valid; 8 bursts
+  in flight in both directions with packets lost; bursts forwarded over 3 links.
 - `test_fabric_address.py`: two nodes with windows of 4 TiB (memory model: pattern of the address
   and the last words written): reads, writes and copies at addresses over 32 bits, end of the
   window, global addresses of 128 nodes of 4 TiB, copy from the end of a node to the next one.
