@@ -201,7 +201,7 @@ class TestFabricCopy(unittest.TestCase):
             self.assertEqual(status, FABRIC_TIMEOUT)
             self.assertLessEqual(count, 4)
             status, count = yield from copy(node, 1, 32, 2, 48, 4)  # Writes word 50.
-            self.assertEqual((status, count), (FABRIC_BUS, 3))
+            self.assertEqual((status, count), (FABRIC_BUS, 2))      # Words before the error.
             self.assertEqual((yield from copy(node, 1, 32, 2, 0, 8)), (FABRIC_OK, 8))
             yield from idle(self, dut)
         run(dut, [generator()])

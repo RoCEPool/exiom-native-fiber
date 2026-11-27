@@ -106,11 +106,11 @@ class FabricPool(LiteXModule):
         # Next copy request: up to the end of the window of the source and of the destination.
         src_room = Signal(window_bits + 1)
         dst_room = Signal(window_bits + 1)
-        size     = Signal(11)
+        size     = Signal(17)
         self.comb += [
             src_room.eq(window - adr[:window_bits]),
             dst_room.eq(window - dst_adr[:window_bits]),
-            *smallest(size, [Constant(chunk, 11), left, src_room, dst_room]),
+            *smallest(size, [Constant(chunk, 17), left, src_room, dst_room]),
         ]
 
         self.timer = timer = WaitTimer(busy_wait)
