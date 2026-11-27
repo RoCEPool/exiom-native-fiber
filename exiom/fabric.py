@@ -21,13 +21,17 @@ Packet (32-bit words, 2 to 4 words; the number of words follows from the kind of
                          [23:19] sequence number on the link, [24] response, [25] flow control,
                          [26] routes, [31:28] magic. Only word used to forward a packet.
 - Word 1 (transaction) : [7:0] tag, [11:8] byte enables (request) or status (response),
-                         [12] write, [13] copy, [21:14] node to copy to, [31:22] words to copy - 1.
-- Word 2               : word address in the destination window (request), read data or words
-                         copied (response).
-- Word 3               : write data (write request) or word address to copy to (copy request).
+                         [12] write, [13] copy, [31:16] bits 47 to 32 of the word address (request).
+- Word 2               : bits 31 to 0 of the word address in the destination window (request),
+                         read data or words copied (response).
+- Word 3               : write data (write request).
 
-Copy request: a write request with the copy bit, answered like a read (words copied in word 2).
-The nodes on the way forward it like any request.
+Word addresses are 48-bit (FABRIC_ADDRESS_BITS): windows of up to 2**48 words of 4 bytes.
+
+Copy request (6 words): write and copy bits; words 1 and 2: word address to copy from; word 3:
+bits 31 to 0 of the word address to copy to; word 4: [7:0] node to copy to, [31:16] bits 47 to 32
+of the word address to copy to; word 5: words to copy - 1. Answered like a read (words copied in
+word 2). The nodes on the way forward it like any request.
 
 Tag: slot of the request in the Requester ([slot_bits-1:0]) and generation of this slot (upper
 bits, incremented each time the slot is reused): a response arriving after its request timed out
@@ -116,25 +120,33 @@ FABRIC_BUSY        = 6 # Copy refused: the node is already copying.
 FABRIC_NO_RESPONSE = 8 # No response within the Requester timeout.
 FABRIC_LINK        = 9 # No link up on this node.
 
-FABRIC_COPY_WORDS = 1024 # Words per copy request, at most.
+FABRIC_ADDRESS_BITS = 48   # Word address in the window of a node.
+FABRIC_COPY_WORDS   = 1024 # Words per copy request, at most.
 
 def request_layout():
-    # Copy (``copy``): ``words`` words from word ``adr`` of node ``dst`` to word ``dat_w`` of node
-    # ``copy_dst``. The result gives the number of words written in ``dat_r``.
-    return [("we", 1), ("dst", 8), ("adr", 32), ("dat_w", 32), ("sel", 4),
-        ("copy", 1), ("copy_dst", 8), ("words", 11)]
+    # Copy (``copy``): ``words`` words from word ``adr`` of node ``dst`` to word ``copy_adr`` of
+    # node ``copy_dst``. The result gives the number of words written in ``dat_r``.
+    return [("we", 1), ("dst", 8), ("adr", FABRIC_ADDRESS_BITS), ("dat_w", 32), ("sel", 4),
+        ("copy", 1), ("copy_dst", 8), ("copy_adr", FABRIC_ADDRESS_BITS), ("words", 11)]
 
 def copy_layout():
     # Copy accepted by a node: ``words`` words from its word ``adr`` to word ``dst_adr`` of node
     # ``dst``, asked by node ``src`` with tag ``tag``.
-    return [("src", 8), ("tag", 8), ("adr", 32), ("dst", 8), ("dst_adr", 32), ("words", 11)]
+    return [("src", 8), ("tag", 8), ("adr", FABRIC_ADDRESS_BITS), ("dst", 8),
+        ("dst_adr", FABRIC_ADDRESS_BITS), ("words", 11)]
 
 def result_layout():
     return [("tag", 8), ("we", 1), ("status", 4), ("dat_r", 32)]
 
+FABRIC_PACKET_WORDS = 6 # Words of the longest packet.
+
 def fabric_packet_layout():
-    # Whole packet: words 0 to 3 and number of words.
-    return [("w0", 32), ("w1", 32), ("w2", 32), ("w3", 32), ("len", 3)]
+    # Whole packet: its words and its number of words.
+    return [(f"w{i}", 32) for i in range(FABRIC_PACKET_WORDS)] + [("len", bits_for(FABRIC_PACKET_WORDS))]
+
+def packet_words(packet):
+    """Words of a packet (Record with ``fabric_packet_layout``)."""
+    return [getattr(packet, f"w{i}") for i in range(FABRIC_PACKET_WORDS)]
 
 def route_word(dst, src, ttl, rsp):
     return Cat(dst, src, ttl[:3] if isinstance(ttl, Signal) else Constant(ttl, 3), Constant(0, 5), rsp,
@@ -148,7 +160,7 @@ def fabric_packet_len(w0, w1, fc_len):
         Mux(route_rt(w0), 4,
         Mux(route_rsp(w0),
             Mux(w1[12], 2, 3),    # Write response, read response.
-            Mux(w1[12], 4, 3))))  # Write request, read request.
+            Mux(w1[12], Mux(w1[13], 6, 4), 3)))) # Copy request, write request, read request.
 
 def route_dst(w0):   return w0[0:8]
 def route_src(w0):   return w0[8:16]
@@ -535,11 +547,18 @@ class FabricRequester(LiteXModule):
             If(alloc,
                 tx_valid.eq(send),
                 tx.w0.eq(route_word(sink.dst, Constant(node_id, 8), max_hops, 0)),
-                tx.w1.eq(Cat(tag, sink.sel, sink.we | sink.copy)),
-                If(sink.copy, tx.w1[13:].eq(Cat(Constant(1, 1), sink.copy_dst, (sink.words - 1)[:10]))),
-                tx.w2.eq(sink.adr),
+                tx.w1.eq(Cat(tag, sink.sel, sink.we | sink.copy, sink.copy, Constant(0, 2), sink.adr[32:48])),
+                tx.w2.eq(sink.adr[:32]),
                 tx.w3.eq(sink.dat_w),
-                tx.len.eq(Mux(sink.we | sink.copy, 4, 3)),
+                tx.w4.eq(0),
+                tx.w5.eq(0),
+                tx.len.eq(Mux(sink.we, 4, 3)),
+                If(sink.copy,
+                    tx.w3.eq(sink.copy_adr[:32]),
+                    tx.w4.eq(Cat(sink.copy_dst, Constant(0, 8), sink.copy_adr[32:48])),
+                    tx.w5.eq(sink.words - 1),
+                    tx.len.eq(6),
+                ),
             )
         ]
 
@@ -560,7 +579,8 @@ class FabricResponder(LiteXModule):
         self.size = size
         self.rx   = rx  = stream.Endpoint(fabric_packet_layout())
         self.tx   = tx  = stream.Endpoint(fabric_packet_layout())
-        self.mem  = mem = wishbone.Interface(data_width=32, adr_width=30)
+        # Window of more than 4 GiB: wider address bus.
+        self.mem  = mem = wishbone.Interface(data_width=32, adr_width=max(30, bits_for(size//4 - 1)))
         self.copy = copy = stream.Endpoint(copy_layout())
 
         # Status.
@@ -582,6 +602,7 @@ class FabricResponder(LiteXModule):
         we      = Signal()
         is_copy = Signal()
         local   = Signal()
+        adr     = Signal(FABRIC_ADDRESS_BITS)
         refused = Signal(4) # Status when the request is not executed (FABRIC_OK: executed).
         self.comb += [
             we.eq(sink.w1[12]),
@@ -589,18 +610,19 @@ class FabricResponder(LiteXModule):
             local.eq(route_dst(sink.w0) == node_id),
             copy.src.eq(route_src(sink.w0)),
             copy.tag.eq(sink.w1[0:8]),
-            copy.adr.eq(sink.w2),
-            copy.dst.eq(sink.w1[14:22]),
-            copy.dst_adr.eq(sink.w3),
-            copy.words.eq(sink.w1[22:32] + 1),
+            adr.eq(Cat(sink.w2, sink.w1[16:32])),
+            copy.adr.eq(adr),
+            copy.dst.eq(sink.w4[0:8]),
+            copy.dst_adr.eq(Cat(sink.w3, sink.w4[16:32])),
+            copy.words.eq(sink.w5[:10] + 1),
             refused.eq(FABRIC_OK),
             If(~local,
                 refused.eq(FABRIC_NODE)
-            ).Elif(sink.w2 >= words,
+            ).Elif(adr >= words,
                 refused.eq(FABRIC_RANGE)
             ).Elif(is_copy,
-                # Words read by a copy: all in the window.
-                If((sink.w2 + copy.words) > words, refused.eq(FABRIC_RANGE))
+                # Words read by a copy: all in the window, FABRIC_COPY_WORDS at most.
+                If(((adr + copy.words) > words) | (sink.w5 >= FABRIC_COPY_WORDS), refused.eq(FABRIC_RANGE))
             ).Elif(we & int(read_only),
                 refused.eq(FABRIC_RO)
             ),
@@ -639,11 +661,11 @@ class FabricResponder(LiteXModule):
         started = Signal() # Access started: goes to its end.
         well    = Signal() # Well formed.
         self.comb += [
-            well.eq(sink.len == Mux(we, 4, 3)),
+            well.eq(sink.len == Mux(we, Mux(is_copy, 6, 4), 3)),
             access.eq(sink.valid & well & (refused == FABRIC_OK) & ~is_copy & (started | free)),
             mem.cyc.eq(access),
             mem.stb.eq(access),
-            mem.adr.eq(sink.w2),
+            mem.adr.eq(adr),
             mem.we.eq(we),
             mem.sel.eq(sink.w1[8:12]),
             mem.dat_w.eq(sink.w3),
@@ -718,8 +740,8 @@ class FabricCopy(LiteXModule):
         src     = Signal(8)
         src_tag = Signal(8)
         dst     = Signal(8)
-        rd_adr  = Signal(32)
-        wr_adr  = Signal(32)
+        rd_adr  = Signal(FABRIC_ADDRESS_BITS)
+        wr_adr  = Signal(FABRIC_ADDRESS_BITS)
         left    = Signal(11) # Words still to read.
         count   = Signal(11) # Words written.
         status  = Signal(4)  # First error.
@@ -731,7 +753,7 @@ class FabricCopy(LiteXModule):
         IDLE, READ, WAIT, WRITE = range(4)
         states = [Signal(2,  name=f"word{i}_state") for i in range(window)]
         tags   = [Signal(8,  name=f"word{i}_tag")   for i in range(window)]
-        adrs   = [Signal(32, name=f"word{i}_adr")   for i in range(window)] # Where to write it.
+        adrs   = [Signal(FABRIC_ADDRESS_BITS, name=f"word{i}_adr") for i in range(window)] # Where to write it.
         dats   = [Signal(32, name=f"word{i}_dat")   for i in range(window)]
 
         self.free_encoder = free_encoder = PriorityEncoder(window)
@@ -882,18 +904,20 @@ class FabricPort(LiteXModule):
         # RX: Packet stream to whole packets.
         # -----------------------------------
         fc_len    = 1 + (classes + 3)//4
+        pw        = FABRIC_PACKET_WORDS
+        len_bits  = bits_for(pw)
         wpb       = link_width//32          # Words per cycle.
-        max_beats = (4 + wpb - 1)//wpb      # Cycles of the longest packet.
+        max_beats = (pw + wpb - 1)//wpb     # Cycles of the longest packet.
         def beats_of(length):
-            return {1: length, 2: (length + 1)[1:3], 4: 1}[wpb]
+            return ((length + (wpb - 1)) >> log2_int(wpb))[:len_bits]
 
         rx       = stream.Endpoint(fabric_packet_layout()) # Whole packet, one cycle.
-        rx_words = [Signal(32, name=f"rx_w{i}") for i in range(4)]
-        rx_beat  = Signal(3) # Cycles of the current packet already received (saturating).
+        rx_words = [Signal(32, name=f"rx_w{i}") for i in range(pw)]
+        rx_beat  = Signal(max=max_beats + 2) # Cycles of the current packet already received (saturating).
         rx_bad   = Signal()  # Packet cut, or not the number of words of its kind.
-        rx_w     = [rx.w0, rx.w1, rx.w2, rx.w3]
+        rx_w     = packet_words(rx)
         self.comb += sink.ready.eq(1) # The link has no backpressure.
-        for i in range(4):
+        for i in range(pw):
             # Word i comes in cycle i//wpb of the packet.
             self.comb += rx_w[i].eq(Mux(rx_beat == (i//wpb), sink.data[32*(i % wpb):32*(i % wpb) + 32], rx_words[i]))
             self.sync += If(sink.valid & (rx_beat == (i//wpb)), rx_words[i].eq(sink.data[32*(i % wpb):32*(i % wpb) + 32]))
@@ -906,7 +930,7 @@ class FabricPort(LiteXModule):
             If(sink.valid,
                 If(sink.last,
                     rx_beat.eq(0)
-                ).Elif(rx_beat != 7,
+                ).Elif(rx_beat != (max_beats + 1),
                     rx_beat.eq(rx_beat + 1)
                 )
             ),
@@ -1065,8 +1089,8 @@ class FabricPort(LiteXModule):
         self.tx_tail  = tx_tail  = Signal(5)
         tx_cur   = Signal(5) # Packet being sent.
         kept     = Signal(5)
-        buf      = [[Signal(32, name=f"tx_buf{i}_w{w}") for i in range(window)] for w in range(4)]
-        buf_len  = [Signal(3, name=f"tx_buf{i}_len") for i in range(window)]
+        buf      = [[Signal(32, name=f"tx_buf{i}_w{w}") for i in range(window)] for w in range(pw)]
+        buf_len  = [Signal(len_bits, name=f"tx_buf{i}_len") for i in range(window)]
         self.comb += [
             kept.eq(tx_tail - tx_acked),
             # Link down: packets are dropped instead of stalling the node.
@@ -1075,9 +1099,7 @@ class FabricPort(LiteXModule):
         for i in range(window):
             self.sync += If(sent & (tx_tail[:slot] == i),
                 buf[0][i].eq(Cat(tx.w0[:19], tx_tail, tx.w0[24:])),
-                buf[1][i].eq(tx.w1),
-                buf[2][i].eq(tx.w2),
-                buf[3][i].eq(tx.w3),
+                *[buf[w][i].eq(packet_words(tx)[w]) for w in range(1, pw)],
                 buf_len[i].eq(tx.len),
             )
         self.sync += If(tx.valid & tx.ready & ~up, If(tx_drops != (2**32 - 1), tx_drops.eq(tx_drops + 1)))
@@ -1167,11 +1189,11 @@ class FabricPort(LiteXModule):
             If(~up, dirty.eq(0)),
         ]
 
-        index      = Signal(2) # Cycle of the packet being sent.
+        index      = Signal(max=max(2, max_beats)) # Cycle of the packet being sent.
         cur_slot   = Signal(slot)
-        cur_len    = Signal(3)
+        cur_len    = Signal(len_bits)
         send_slot  = Signal(slot)
-        send_len   = Signal(3)
+        send_len   = Signal(len_bits)
         sending    = Signal(5) # Sequence number of the packet whose last cycle is sent.
         fc_latched = [Signal(32, name=f"fc_l{i}") for i in range(4)]
         self.sync += If(fc_sent, *[fc_latched[i].eq(fc_words[i]) for i in range(4)])
@@ -1184,10 +1206,10 @@ class FabricPort(LiteXModule):
         ]
 
         def beat(words, n):
-            """Words of the cycle n of a packet (words: 4 Signals, or 4 functions of nothing)."""
+            """Words of the cycle n of a packet (words: list of Signals)."""
             beats = []
             for b in range(max_beats):
-                beats.append(Cat(*[words[b*wpb + j] if (b*wpb + j) < 4 else Constant(0, 32) for j in range(wpb)]))
+                beats.append(Cat(*[words[b*wpb + j] if (b*wpb + j) < len(words) else Constant(0, 32) for j in range(wpb)]))
             return beats[n] if isinstance(n, int) else Array(beats)[n]
 
         def send(words, length, done):
@@ -1203,12 +1225,12 @@ class FabricPort(LiteXModule):
                 )
             ]
 
-        send_words = [Array(buf[w])[send_slot] for w in range(4)]
-        cur_words  = [Array(buf[w])[cur_slot]  for w in range(4)]
+        send_words = [Array(buf[w])[send_slot] for w in range(pw)]
+        cur_words  = [Array(buf[w])[cur_slot]  for w in range(pw)]
         self.tx_fsm = tx_fsm = ResetInserter()(FSM(reset_state="IDLE"))
         self.comb += tx_fsm.reset.eq(~up)
-        ctl_words = [Signal(32, name=f"ctl_w{i}") for i in range(4)]
-        ctl_len   = Signal(3)
+        ctl_words = [Signal(32, name=f"ctl_w{i}") for i in range(pw)]
+        ctl_len   = Signal(len_bits)
         tx_fsm.act("IDLE",
             NextValue(index, 0),
             sending.eq(tx_send),
@@ -1219,10 +1241,7 @@ class FabricPort(LiteXModule):
                 rewind_apply.eq(1)
             ).Elif(ctl.valid,
                 ctl.ready.eq(1),
-                NextValue(ctl_words[0], ctl.w0),
-                NextValue(ctl_words[1], ctl.w1),
-                NextValue(ctl_words[2], ctl.w2),
-                NextValue(ctl_words[3], ctl.w3),
+                *[NextValue(ctl_words[w], packet_words(ctl)[w]) for w in range(pw)],
                 NextValue(ctl_len,      ctl.len),
                 NextState("CONTROL")
             ).Elif(available,
@@ -1245,7 +1264,7 @@ class FabricPort(LiteXModule):
             *send(ctl_words, ctl_len, [NextState("IDLE")])
         )
         tx_fsm.act("FLOW-CONTROL",
-            *send(fc_latched, Constant(fc_len, 3), [NextState("IDLE")])
+            *send(fc_latched, Constant(fc_len, len_bits), [NextState("IDLE")])
         )
         tx_fsm.act("PACKET",
             sending.eq(tx_cur),

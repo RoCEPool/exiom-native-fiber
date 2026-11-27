@@ -40,7 +40,7 @@ from litex.gen import *
 
 from litex.soc.interconnect import stream
 
-from exiom.fabric import FABRIC_OK, FABRIC_RANGE
+from exiom.fabric import FABRIC_OK, FABRIC_RANGE, FABRIC_ADDRESS_BITS
 
 # Constants ----------------------------------------------------------------------------------------
 
@@ -50,13 +50,13 @@ BLOCK_PUSH  = 1
 # Layouts ------------------------------------------------------------------------------------------
 
 def block_cmd_layout(slot_bits, words_bits):
-    return [("op", 2), ("slot", slot_bits), ("dst", 8), ("adr", 32), ("words", words_bits)]
+    return [("op", 2), ("slot", slot_bits), ("dst", 8), ("adr", FABRIC_ADDRESS_BITS), ("words", words_bits)]
 
 def block_done_layout(slot_bits, words_bits):
     return [("op", 2), ("slot", slot_bits), ("status", 4), ("words", words_bits)]
 
 def block_out_layout():
-    return [("adr", 32), ("data", 32)]
+    return [("adr", FABRIC_ADDRESS_BITS), ("data", 32)]
 
 # Block Cache --------------------------------------------------------------------------------------
 
@@ -105,7 +105,7 @@ class FabricBlockCache(LiteXModule):
         op     = Signal(2)
         slot   = Signal(slot_bits)
         dst    = Signal(8)
-        adr    = Signal(32)
+        adr    = Signal(FABRIC_ADDRESS_BITS)
         words  = Signal(words_bits)
         status = Signal(4)
         base   = Signal(max=slots*slot_words + 1)
