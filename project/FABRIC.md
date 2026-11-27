@@ -313,6 +313,24 @@ With a Wishbone memory the limit is the Responders (one memory word every two cy
 source to read and at the destination to write). With the memory port (see Performance
 scenarios) a 32-bit link becomes the limit again (11 cycles for a burst of 8 words).
 
+## Control frames: commands from a host
+
+`exiom/frame.py`, for a node placed between the network card of a server and the fabric. The host
+sends a command in an Ethernet frame (EtherType 0x88B5) to the MAC address of the node: read,
+write or copy with global addresses, and a request id. `FabricFrame` runs it with `FabricPool`
+and sends a reply frame back (status, read data or words copied, request id). The data of a copy
+goes from the source node straight to the destination node: it does not go through the host or
+its network card.
+
+- Byte streams with `last` (frames without preamble and FCS, the user side of a MAC). The MAC and
+  the PHY to the network card are not part of it.
+- Only these frames are handled. The other frames are ignored: they are not forwarded through the
+  fabric (the fabric does not replace the network of the hosts).
+- One command at a time: a command received while another one runs is dropped and counted; the
+  host sends it again when the reply does not come. Commands cut short or with an unknown
+  operation are dropped and counted.
+- Addresses outside the pool are answered with `FABRIC_NODE`.
+
 ## Interfaces
 
 - `FabricNode(node_id, size, ports, routes, max_hops, ...)`: one node (`routes`: costs at reset,
@@ -345,15 +363,20 @@ scenarios) a 32-bit link becomes the limit again (11 cycles for a burst of 8 wor
 - With a SerWB link, use CRC on the cores and `with_auto_retrain=True` on the Master PHY.
 - A Responder with a Wishbone memory executes one request at a time, two cycles per word; with
   the memory port, one word per cycle (see Performance scenarios).
-- Copies: `copy_lanes` at a time per source node (see Copies and global addresses);
-  no entry yet for a host to ask for a copy (the user of `FabricPool` is the test bench).
+- Copies: `copy_lanes` at a time per source node (see Copies and global addresses). A host asks
+  them with control frames, one command at a time per node.
+- One path per destination. Spreading the traffic over the paths of the same length was
+  evaluated with the topology model and not implemented: with chassis of 8 and 9 ports per node
+  there is one cable between two chassis, so nothing to spread (busiest cable at 128 nodes: 72
+  pairs of nodes with one path, 73.5 with an even split); with 11 ports per node it would go from
+  64 to 45.5. More cables between the chassis come first.
 
 ## Verification
 
 ```sh
 python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_network.py \
     test/test_fabric_copy.py test/test_fabric_burst.py test/test_fabric_address.py \
-    test/test_fabric_pipelined.py test/test_fabric_perf.py \
+    test/test_fabric_pipelined.py test/test_fabric_perf.py test/test_fabric_frame.py \
     test/test_fabric_bench.py test/test_fabric_sim.py
 ```
 
@@ -389,6 +412,10 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   of the global addresses and of the 4-node networks run again with them; plus every status,
   errors and missing answers with 8 requests in flight, a memory that stalls or stops taking
   accesses, a Wishbone slave behind the port, and the rate (1 word per cycle against 0.5).
+- `test_fabric_frame.py`: control frames: copy, write and read asked by frames (the data of the
+  copy does not go through the node that receives the frames), errors of the pool in the reply,
+  frames that are not commands (other EtherType, other destination, broadcast, cut, unknown
+  operation), a command during another one, a reply taken slowly.
 - `test_fabric_perf.py`: performance scenarios (see above), with floors about 25 % under the
   rates measured.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
