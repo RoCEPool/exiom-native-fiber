@@ -17,6 +17,8 @@ same statements order inside a group), in time proportional to the number of sta
 simulator itself is not modified; if it stops using this function, simulations just start slower.
 """
 
+import gc
+
 from migen.fhdl import tracer as _tracer
 from migen.fhdl.tools import list_targets, flat_iteration
 
@@ -91,3 +93,8 @@ def run_simulation(*args, **kwargs):
     finally:
         if original is not None:
             _core.group_by_targets = original
+        # Migen keeps every object of every design built, to number them: forget those of the
+        # designs already simulated (the memory of a long test session grows with them).
+        getattr(_tracer, "classname_to_objs", {}).clear()
+        _indexes.clear()
+        gc.collect()
