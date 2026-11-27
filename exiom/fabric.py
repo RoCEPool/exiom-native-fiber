@@ -21,9 +21,13 @@ Packet (32-bit words, 2 to 4 words; the number of words follows from the kind of
                          [23:19] sequence number on the link, [24] response, [25] flow control,
                          [26] routes, [31:28] magic. Only word used to forward a packet.
 - Word 1 (transaction) : [7:0] tag, [11:8] byte enables (request) or status (response),
-                         [12] write.
-- Word 2               : word address in the destination window (request) or read data (response).
-- Word 3               : write data (write request).
+                         [12] write, [13] copy, [21:14] node to copy to, [31:22] words to copy - 1.
+- Word 2               : word address in the destination window (request), read data or words
+                         copied (response).
+- Word 3               : write data (write request) or word address to copy to (copy request).
+
+Copy request: a write request with the copy bit, answered like a read (words copied in word 2).
+The nodes on the way forward it like any request.
 
 Tag: slot of the request in the Requester ([slot_bits-1:0]) and generation of this slot (upper
 bits, incremented each time the slot is reused): a response arriving after its request timed out
@@ -69,11 +73,21 @@ Semantics:
   the links of their route do not change state. Results are returned as they complete, identified
   by their tag.
 - FABRIC_NO_RESPONSE and FABRIC_LINK mean "not confirmed": the request may have been executed.
+- Copy (``FabricCopy``): the node that receives a copy request reads the words in its own window
+  and writes them in the window of the node to copy to, with its own requests: the data goes
+  straight from the source node to the destination node, not through the node that asked. One copy
+  at a time per source node: a copy request received during another one is refused at once with
+  FABRIC_BUSY (it never waits in the Responder, so two nodes copying to each other cannot wait for
+  each other). The response gives the first error and the number of words written; statuses 8 and
+  9 in a copy response are those of the requests of the source node (not confirmed).
 - Packets lost on a link are sent again by the link. Packets in a node or on a link that goes
   down are lost, and while this change spreads in the fabric (a few route packet periods),
   packets can be sent towards the link that is down: their requests end with FABRIC_NODE or
   FABRIC_NO_RESPONSE. Requests are not sent again end to end.
 """
+
+from functools import reduce
+from operator  import and_, or_
 
 from migen import *
 from migen.genlib.coding import PriorityEncoder
@@ -98,11 +112,22 @@ FABRIC_RO          = 2 # Write to a read-only window.
 FABRIC_BUS         = 3 # Memory bus error.
 FABRIC_TIMEOUT     = 4 # Memory did not answer.
 FABRIC_NODE        = 5 # Destination node not reachable (unknown, or no route within the hop limit).
+FABRIC_BUSY        = 6 # Copy refused: the node is already copying.
 FABRIC_NO_RESPONSE = 8 # No response within the Requester timeout.
 FABRIC_LINK        = 9 # No link up on this node.
 
+FABRIC_COPY_WORDS = 1024 # Words per copy request, at most.
+
 def request_layout():
-    return [("we", 1), ("dst", 8), ("adr", 32), ("dat_w", 32), ("sel", 4)]
+    # Copy (``copy``): ``words`` words from word ``adr`` of node ``dst`` to word ``dat_w`` of node
+    # ``copy_dst``. The result gives the number of words written in ``dat_r``.
+    return [("we", 1), ("dst", 8), ("adr", 32), ("dat_w", 32), ("sel", 4),
+        ("copy", 1), ("copy_dst", 8), ("words", 11)]
+
+def copy_layout():
+    # Copy accepted by a node: ``words`` words from its word ``adr`` to word ``dst_adr`` of node
+    # ``dst``, asked by node ``src`` with tag ``tag``.
+    return [("src", 8), ("tag", 8), ("adr", 32), ("dst", 8), ("dst_adr", 32), ("words", 11)]
 
 def result_layout():
     return [("tag", 8), ("we", 1), ("status", 4), ("dat_r", 32)]
@@ -344,12 +369,18 @@ class FabricRequester(LiteXModule):
     """Sends requests and returns their results, with up to ``requests`` requests in flight.
 
     ``sink``: requests (``tag`` gives the tag of the request being accepted). ``source``: results.
-    ``tx``/``rx``: request packets out, response packets in (whole packets).
+    ``copy_sink``/``copy_source``: same, for the requests of the copies run by this node
+    (``FabricCopy``); they share the slots with the requests of ``sink``, served in turn.
+    ``tx``/``rx``: request packets out, response packets in (whole packets). ``copy_timeout``:
+    timeout of copy requests (default: 32 x ``timeout``).
     """
-    def __init__(self, node_id, ports=1, max_hops=1, requests=8, timeout=4096):
+    def __init__(self, node_id, ports=1, max_hops=1, requests=8, timeout=4096, copy_timeout=None):
         assert requests >= 1 and requests <= 64
-        self.sink    = sink    = stream.Endpoint(request_layout())
-        self.source  = source  = stream.Endpoint(result_layout())
+        copy_timeout = 32*timeout if copy_timeout is None else copy_timeout
+        self.sink        = user_sink   = stream.Endpoint(request_layout())
+        self.source      = source      = stream.Endpoint(result_layout())
+        self.copy_sink   = copy_sink   = stream.Endpoint(request_layout())
+        self.copy_source = copy_source = stream.Endpoint(result_layout())
         self.tag     = tag     = Signal(8)
         self.tx      = tx      = stream.Endpoint(fabric_packet_layout())
         self.rx      = rx      = stream.Endpoint(fabric_packet_layout())
@@ -365,6 +396,21 @@ class FabricRequester(LiteXModule):
 
         slot_bits = max(1, bits_for(requests - 1))
         gen_bits  = 8 - slot_bits
+
+        # Request served: ``sink`` and ``copy_sink`` in turn.
+        # ----------------------------------------------------
+        sink       = stream.Endpoint(request_layout())
+        from_copy  = Signal() # Request served is from ``copy_sink``.
+        last_copy  = Signal()
+        self.comb += [
+            from_copy.eq(copy_sink.valid & (~user_sink.valid | ~last_copy)),
+            If(from_copy,
+                *copy_sink.connect(sink)
+            ).Else(
+                *user_sink.connect(sink)
+            ),
+        ]
+        self.sync += If(sink.valid & sink.ready, last_copy.eq(from_copy))
 
         # Destination of the request.
         # ---------------------------
@@ -387,7 +433,9 @@ class FabricRequester(LiteXModule):
         statuses = [Signal(4,         name=f"slot{i}_status") for i in range(requests)]
         dat_rs   = [Signal(32,        name=f"slot{i}_dat_r")  for i in range(requests)]
         locals_  = [Signal(1,         name=f"slot{i}_local")  for i in range(requests)]
-        timers   = [Signal(max=timeout + 1, name=f"slot{i}_timer") for i in range(requests)]
+        owners   = [Signal(1,         name=f"slot{i}_owner")  for i in range(requests)] # 1: copy_sink.
+        copies   = [Signal(1,         name=f"slot{i}_copy")   for i in range(requests)] # Copy request.
+        timers   = [Signal(max=max(timeout, copy_timeout) + 1, name=f"slot{i}_timer") for i in range(requests)]
 
         # Allocation (first free slot).
         self.free_encoder = free_encoder = PriorityEncoder(requests)
@@ -409,30 +457,36 @@ class FabricRequester(LiteXModule):
             ),
         ]
 
-        # Results (first done slot).
-        self.done_encoder = done_encoder = PriorityEncoder(requests)
-        self.comb += done_encoder.i.eq(Cat(*[s == DONE for s in states]))
-        release      = Signal()
-        release_slot = Signal(slot_bits)
-        self.comb += [
-            release_slot.eq(done_encoder.o),
-            source.valid.eq(~done_encoder.n),
-            source.tag.eq(Cat(release_slot, Array(gens)[release_slot])),
-            source.we.eq(Array(wes)[release_slot]),
-            source.status.eq(Array(statuses)[release_slot]),
-            source.dat_r.eq(Array(dat_rs)[release_slot]),
-            release.eq(source.valid & source.ready),
-        ]
+        # Results (first done slot of each owner).
+        releases = []
+        for owner, endpoint in enumerate([source, copy_source]):
+            done_encoder = PriorityEncoder(requests)
+            self.add_module(f"done_encoder{owner}", done_encoder)
+            release      = Signal(name=f"release{owner}")
+            release_slot = Signal(slot_bits, name=f"release{owner}_slot")
+            self.comb += [
+                done_encoder.i.eq(Cat(*[(s == DONE) & (o == owner) for s, o in zip(states, owners)])),
+                release_slot.eq(done_encoder.o),
+                endpoint.valid.eq(~done_encoder.n),
+                endpoint.tag.eq(Cat(release_slot, Array(gens)[release_slot])),
+                endpoint.we.eq(Array(wes)[release_slot]),
+                endpoint.status.eq(Array(statuses)[release_slot]),
+                endpoint.dat_r.eq(Array(dat_rs)[release_slot]),
+                release.eq(endpoint.valid & endpoint.ready),
+            ]
+            releases.append((release, release_slot))
 
         for i in range(requests):
             slot_up = Signal(name=f"slot{i}_up")
             self.comb += slot_up.eq(locals_[i] | any_up)
             self.sync += [
                 If(alloc & (alloc_slot == i),
-                    wes[i].eq(sink.we),
+                    wes[i].eq(sink.we & ~sink.copy),
                     timers[i].eq(0),
                     dat_rs[i].eq(0),
                     locals_[i].eq(local),
+                    owners[i].eq(from_copy),
+                    copies[i].eq(sink.copy),
                     If(send,
                         states[i].eq(PENDING),
                     ).Else(
@@ -449,13 +503,13 @@ class FabricRequester(LiteXModule):
                         states[i].eq(DONE),
                         statuses[i].eq(rx.w1[8:12]),
                         dat_rs[i].eq(Mux(rx.len == 3, rx.w2, 0)),
-                    ).Elif(timers[i] == timeout,
+                    ).Elif(timers[i] == Mux(copies[i], copy_timeout, timeout),
                         states[i].eq(DONE),
                         statuses[i].eq(FABRIC_NO_RESPONSE),
                     ).Else(
                         timers[i].eq(timers[i] + 1)
                     )
-                ).Elif((states[i] == DONE) & release & (release_slot == i),
+                ).Elif((states[i] == DONE) & reduce(or_, [r & (slot == i) for r, slot in releases]),
                     states[i].eq(FREE),
                     gens[i].eq(gens[i] + 1),
                 )
@@ -481,10 +535,11 @@ class FabricRequester(LiteXModule):
             If(alloc,
                 tx_valid.eq(send),
                 tx.w0.eq(route_word(sink.dst, Constant(node_id, 8), max_hops, 0)),
-                tx.w1.eq(Cat(tag, sink.sel, sink.we)),
+                tx.w1.eq(Cat(tag, sink.sel, sink.we | sink.copy)),
+                If(sink.copy, tx.w1[13:].eq(Cat(Constant(1, 1), sink.copy_dst, (sink.words - 1)[:10]))),
                 tx.w2.eq(sink.adr),
                 tx.w3.eq(sink.dat_w),
-                tx.len.eq(Mux(sink.we, 4, 3)),
+                tx.len.eq(Mux(sink.we | sink.copy, 4, 3)),
             )
         ]
 
@@ -496,7 +551,9 @@ class FabricResponder(LiteXModule):
     ``rx``: request packets in (``buffer_depth`` packets, with backpressure), ``tx``: response
     packets out. ``mem``: Wishbone Master to the memory (word addresses relative to the window).
     Requests for another node (given to this node because they cannot go further) are answered
-    with FABRIC_NODE.
+    with FABRIC_NODE. ``copy``: copy requests for this node, checked (source words in the window),
+    for ``FabricCopy`` which answers those it takes; when it is not ready, they are answered with
+    FABRIC_BUSY.
     """
     def __init__(self, node_id, size, max_hops=1, read_only=False, timeout=1024, buffer_depth=4):
         assert size > 0 and (size % 4) == 0 and buffer_depth >= 2
@@ -504,6 +561,7 @@ class FabricResponder(LiteXModule):
         self.rx   = rx  = stream.Endpoint(fabric_packet_layout())
         self.tx   = tx  = stream.Endpoint(fabric_packet_layout())
         self.mem  = mem = wishbone.Interface(data_width=32, adr_width=30)
+        self.copy = copy = stream.Endpoint(copy_layout())
 
         # Status.
         self.requests  = requests  = Signal(32) # Requests answered.
@@ -522,16 +580,27 @@ class FabricResponder(LiteXModule):
         # Request at the head of the buffer.
         # ----------------------------------
         we      = Signal()
+        is_copy = Signal()
         local   = Signal()
         refused = Signal(4) # Status when the request is not executed (FABRIC_OK: executed).
         self.comb += [
             we.eq(sink.w1[12]),
+            is_copy.eq(sink.w1[12] & sink.w1[13]),
             local.eq(route_dst(sink.w0) == node_id),
+            copy.src.eq(route_src(sink.w0)),
+            copy.tag.eq(sink.w1[0:8]),
+            copy.adr.eq(sink.w2),
+            copy.dst.eq(sink.w1[14:22]),
+            copy.dst_adr.eq(sink.w3),
+            copy.words.eq(sink.w1[22:32] + 1),
             refused.eq(FABRIC_OK),
             If(~local,
                 refused.eq(FABRIC_NODE)
             ).Elif(sink.w2 >= words,
                 refused.eq(FABRIC_RANGE)
+            ).Elif(is_copy,
+                # Words read by a copy: all in the window.
+                If((sink.w2 + copy.words) > words, refused.eq(FABRIC_RANGE))
             ).Elif(we & int(read_only),
                 refused.eq(FABRIC_RO)
             ),
@@ -571,7 +640,7 @@ class FabricResponder(LiteXModule):
         well    = Signal() # Well formed.
         self.comb += [
             well.eq(sink.len == Mux(we, 4, 3)),
-            access.eq(sink.valid & well & (refused == FABRIC_OK) & (started | free)),
+            access.eq(sink.valid & well & (refused == FABRIC_OK) & ~is_copy & (started | free)),
             mem.cyc.eq(access),
             mem.stb.eq(access),
             mem.adr.eq(sink.w2),
@@ -585,6 +654,15 @@ class FabricResponder(LiteXModule):
                 ).Elif(refused != FABRIC_OK,
                     status.eq(refused),
                     respond.eq(free),
+                ).Elif(is_copy,
+                    # Taken by the copy engine (which answers it), or refused: never waits here.
+                    copy.valid.eq(1),
+                    If(copy.ready,
+                        sink.ready.eq(1)
+                    ).Else(
+                        status.eq(FABRIC_BUSY),
+                        respond.eq(free),
+                    )
                 ).Elif(access & mem.ack,
                     status.eq(FABRIC_OK),
                     dat_r.eq(mem.dat_r),
@@ -603,6 +681,159 @@ class FabricResponder(LiteXModule):
             If(access, started.eq(1)),
             If(respond | ~access, started.eq(0)),
             If(sink.valid & sink.ready & ~well, malformed.eq(malformed + 1)),
+        ]
+
+# Fabric Copy --------------------------------------------------------------------------------------
+
+class FabricCopy(LiteXModule):
+    """Runs the copies asked to this node: reads the words in the window of the node and writes
+    them in the window of the destination node, ``window`` words at a time.
+
+    ``cmd``: copy to run (from the Responder; one at a time). ``sink``/``source``/``tag``: requests
+    and results (``copy_sink``/``copy_source``/``tag`` of the Requester): the words are read with
+    requests to this node itself and written with requests to the destination node. ``tx``:
+    response to the node that asked the copy (status: first error, word 2: words written).
+
+    After an error no more word is read; the words already read are not written. The words are
+    not written in order: when the source and the destination overlap, the result is not defined.
+    """
+    def __init__(self, node_id, max_hops=1, window=4):
+        assert window >= 1
+        self.cmd    = cmd    = stream.Endpoint(copy_layout())
+        self.sink   = sink   = stream.Endpoint(request_layout())
+        self.source = source = stream.Endpoint(result_layout())
+        self.tag    = tag    = Signal(8)
+        self.tx     = tx     = stream.Endpoint(fabric_packet_layout())
+
+        # Status.
+        self.copies = copies = Signal(32) # Copies run.
+        self.words  = words  = Signal(32) # Words written.
+        self.errors = errors = Signal(32) # Copies ended by an error.
+
+        # # #
+
+        # Copy running.
+        # -------------
+        busy    = Signal()
+        src     = Signal(8)
+        src_tag = Signal(8)
+        dst     = Signal(8)
+        rd_adr  = Signal(32)
+        wr_adr  = Signal(32)
+        left    = Signal(11) # Words still to read.
+        count   = Signal(11) # Words written.
+        status  = Signal(4)  # First error.
+        failed  = Signal()
+        self.comb += failed.eq(status != FABRIC_OK)
+
+        # Words in flight: read asked (READ), read (WAIT), write asked (WRITE).
+        # -----------------------------------------------------------------------
+        IDLE, READ, WAIT, WRITE = range(4)
+        states = [Signal(2,  name=f"word{i}_state") for i in range(window)]
+        tags   = [Signal(8,  name=f"word{i}_tag")   for i in range(window)]
+        adrs   = [Signal(32, name=f"word{i}_adr")   for i in range(window)] # Where to write it.
+        dats   = [Signal(32, name=f"word{i}_dat")   for i in range(window)]
+
+        self.free_encoder = free_encoder = PriorityEncoder(window)
+        self.wait_encoder = wait_encoder = PriorityEncoder(window)
+        idle = Signal()
+        self.comb += [
+            free_encoder.i.eq(Cat(*[s == IDLE for s in states])),
+            wait_encoder.i.eq(Cat(*[s == WAIT for s in states])),
+            idle.eq(reduce(and_, [s == IDLE for s in states])),
+        ]
+
+        # Requests: the words read first (they free the source), then the next read.
+        do_write = Signal()
+        do_read  = Signal()
+        self.comb += [
+            do_write.eq(busy & ~failed & ~wait_encoder.n),
+            do_read.eq(busy & ~failed & ~do_write & (left != 0) & ~free_encoder.n),
+            sink.valid.eq(do_write | do_read),
+            sink.sel.eq(0b1111),
+            If(do_write,
+                sink.we.eq(1),
+                sink.dst.eq(dst),
+                sink.adr.eq(Array(adrs)[wait_encoder.o]),
+                sink.dat_w.eq(Array(dats)[wait_encoder.o]),
+            ).Else(
+                sink.dst.eq(node_id),
+                sink.adr.eq(rd_adr),
+            ),
+            source.ready.eq(1),
+        ]
+        sent = Signal()
+        self.comb += sent.eq(sink.valid & sink.ready)
+        written = Signal()
+        for i in range(window):
+            match = Signal(name=f"word{i}_match")
+            self.comb += match.eq(source.valid & (source.tag == tags[i]))
+            self.sync += [
+                If(sent & do_read & (free_encoder.o == i),
+                    states[i].eq(READ),
+                    tags[i].eq(tag),
+                    adrs[i].eq(wr_adr),
+                ).Elif(sent & do_write & (wait_encoder.o == i),
+                    states[i].eq(WRITE),
+                    tags[i].eq(tag),
+                ).Elif((states[i] == READ) & match,
+                    dats[i].eq(source.dat_r),
+                    states[i].eq(Mux(source.status == FABRIC_OK, WAIT, IDLE)),
+                ).Elif((states[i] == WRITE) & match,
+                    states[i].eq(IDLE),
+                ).Elif((states[i] == WAIT) & failed,
+                    states[i].eq(IDLE),
+                )
+            ]
+        results = Signal() # Result of a request of the copy.
+        self.comb += [
+            results.eq(source.valid & reduce(or_, [
+                ((s == READ) | (s == WRITE)) & (source.tag == t) for s, t in zip(states, tags)])),
+            written.eq(source.valid & (source.status == FABRIC_OK) & reduce(or_, [
+                (s == WRITE) & (source.tag == t) for s, t in zip(states, tags)])),
+        ]
+
+        # Response: one packet waiting to be taken by the switch.
+        # --------------------------------------------------------
+        self.comb += cmd.ready.eq(~busy)
+        self.sync += [
+            If(tx.valid & tx.ready,
+                tx.valid.eq(0),
+                busy.eq(0),
+            ),
+            If(cmd.valid & cmd.ready,
+                busy.eq(1),
+                src.eq(cmd.src),
+                src_tag.eq(cmd.tag),
+                dst.eq(cmd.dst),
+                rd_adr.eq(cmd.adr),
+                wr_adr.eq(cmd.dst_adr),
+                left.eq(cmd.words),
+                count.eq(0),
+                status.eq(FABRIC_OK),
+                copies.eq(copies + 1),
+            ),
+            If(sent & do_read,
+                rd_adr.eq(rd_adr + 1),
+                wr_adr.eq(wr_adr + 1),
+                left.eq(left - 1),
+            ),
+            If(results & (source.status != FABRIC_OK) & ~failed,
+                status.eq(source.status),
+            ),
+            If(written,
+                count.eq(count + 1),
+                words.eq(words + 1),
+            ),
+            # End: nothing left to read (or an error) and no word in flight.
+            If(busy & ~tx.valid & idle & ((left == 0) | failed) & ~(cmd.valid & cmd.ready),
+                tx.valid.eq(1),
+                tx.w0.eq(route_word(src, Constant(node_id, 8), max_hops, 1)),
+                tx.w1.eq(Cat(src_tag, status, Constant(0, 1))),
+                tx.w2.eq(count),
+                tx.len.eq(3),
+                If(failed, errors.eq(errors + 1)),
+            ),
         ]
 
 # Fabric Port --------------------------------------------------------------------------------------
@@ -1034,6 +1265,8 @@ class FabricNode(LiteXModule):
     """
     def __init__(self, node_id, size, ports=1, routes=None, max_hops=1, requests=8, read_only=False,
         request_timeout = 4096,
+        copy_timeout    = None,
+        copy_window     = 4,
         memory_timeout  = 1024,
         buffer_depth    = 4,
         queue_depth     = 4,
@@ -1066,8 +1299,9 @@ class FabricNode(LiteXModule):
         self.requester = requester = FabricRequester(node_id,
             ports    = ports,
             max_hops = max_hops,
-            requests = requests,
-            timeout  = request_timeout,
+            requests     = requests,
+            timeout      = request_timeout,
+            copy_timeout = copy_timeout,
         )
         self.responder = responder = FabricResponder(node_id,
             size         = size,
@@ -1076,6 +1310,14 @@ class FabricNode(LiteXModule):
             timeout      = memory_timeout,
             buffer_depth = buffer_depth,
         )
+        # Copies asked to this node: taken from the Responder, run with requests of the Requester.
+        self.copy = copy = FabricCopy(node_id, max_hops=max_hops, window=min(copy_window, requests))
+        self.comb += [
+            responder.copy.connect(copy.cmd),
+            copy.sink.connect(requester.copy_sink),
+            copy.tag.eq(requester.tag),
+            requester.copy_source.connect(copy.source),
+        ]
         self.ports = fports = []
         for p in range(ports):
             port = FabricPort(max_hops=max_hops, queue_depth=queue_depth, fc_period=fc_period,
@@ -1100,7 +1342,8 @@ class FabricNode(LiteXModule):
 
         # Switch.
         # -------
-        # Inputs: packets injected by this node (Responder, Requester) and the queues of the ports.
+        # Inputs: packets injected by this node (Responder, Requester, responses of the copies) and
+        # the queues of the ports.
         # Outputs: the ports, the Requester (responses) and the Responder (requests).
         #
         # Each group of inputs (the Responder, the Requester, each port) proposes one packet per
@@ -1134,6 +1377,7 @@ class FabricNode(LiteXModule):
         groups = [] # Inputs: (endpoint, port it came from (None: injected), links crossed).
         groups.append([(responder.tx, None, 0)])
         groups.append([(requester.tx, None, 0)])
+        groups.append([(copy.tx,      None, 0)])
         for p, port in enumerate(fports):
             groups.append([(queue, p, (c % max_hops) + 1) for c, queue in enumerate(port.queues)])
 
