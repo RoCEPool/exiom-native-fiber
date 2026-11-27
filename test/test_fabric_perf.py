@@ -359,8 +359,8 @@ class TestFabricPerf(unittest.TestCase):
         True  : [4330, 10200, 9900, 1090],
     }
     copies_floors = {
-        False : [2700, 2660, 240],
-        True  : [4900, 4800, 375],
+        False : [2700, 2660, 315],
+        True  : [4900, 4800, 550],
     }
 
     def requests_16_nodes(self, pipelined):
