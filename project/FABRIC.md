@@ -354,6 +354,10 @@ reached with `FabricPool`.
 - ECN: a packet marked CE makes a CNP to its requester, at most one per `cnp_interval` cycles.
 - Queue pairs, memory regions and page table entries are written by the host (`qp_cfg`, `mr_cfg`,
   `pt_cfg`); there is no connection manager in the FPGA.
+- Page table entries have a resident bit. A packet that meets a page not resident is dropped
+  without answer and the entry goes to the host (`miss`); the requester sends the packet again.
+  A write sets the dirty bit of its page (cleared by the host, `dirty_cfg`). `idle` and `packets`
+  let the host wait for the end of the packet being processed.
 
 First version, for the protocol and not yet for the throughput:
 
@@ -369,6 +373,31 @@ First version, for the protocol and not yet for the throughput:
 - The ICRC follows IBA Annex A17 as the Linux software RoCE driver computes it; it is checked here
   against the software model of the tests only. Talking to a real network card is the check
   (phase 2 of the plan).
+
+## Memory tiers: host software of a memory server
+
+`exiom/tier.py`, in Python for the simulation; the same steps go to the driver of the card on
+hardware. The memory of the fabric is a cache of the persistent layer (NVMe, the RoCEPool storage
+layer): each page of a region has a place on NVMe, and a frame (DRAM page) while it is resident.
+
+- `MemoryServer.region()`: page table entries and NVMe pages of a region, written in the journal;
+  pages start not resident (zeros until written).
+- `service()`: the misses given by the target; the page is read from NVMe into a free frame and
+  made resident. With no free frame, the oldest page brought in that is not pinned is evicted:
+  made not resident, then the host waits for the end of the packet being processed, then writes
+  the page to NVMe if it is dirty.
+- `flush()`: dirty pages to NVMe (dirty bit cleared before the copy, so a write during the copy
+  marks the page again).
+- `recover()`: after a power loss, the regions come back from the journal on a fresh target,
+  every page not resident; the data comes back from NVMe on the first access. Writes after the
+  last flush of their page are lost.
+- `connect()`: queue pair context from the connection exchange (out of band) into the target.
+
+A READ dropped on a miss is run again when the requester sends it again, maybe after the messages
+sent after it: like any READ run again in RC it can see their writes, so a client that writes
+bytes it has just asked to read fences the write (`IBV_SEND_FENCE`). Eviction is first in, first
+out (the target does not report the pages used); the frames are moved directly in the memories
+in the tests (PCIe DMA on hardware, not written yet).
 
 ## Interfaces
 
@@ -416,7 +445,8 @@ First version, for the protocol and not yet for the throughput:
 python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_network.py \
     test/test_fabric_copy.py test/test_fabric_burst.py test/test_fabric_address.py \
     test/test_fabric_pipelined.py test/test_fabric_perf.py test/test_fabric_frame.py \
-    test/test_fabric_bench.py test/test_fabric_sim.py test/test_fabric_roce.py
+    test/test_fabric_bench.py test/test_fabric_sim.py test/test_fabric_roce.py \
+    test/test_fabric_tier.py
 ```
 
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
@@ -463,6 +493,10 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   read-only region, an address not aligned, SEND, errors of the fabric in a read and a write;
   bad ICRC, unknown queue pairs, other UDP port and IP dropped without answer; CNP on CE marks;
   responses taken slowly by the network card.
+- `test_fabric_tier.py`: memory tiers with the RoCE target: a region of 8 pages on 4 frames
+  (misses, evictions, write backs, a pinned page never evicted, the data right in memory and on
+  NVMe); power loss after flushes and a write not flushed: on a fresh target the regions come back
+  from the journal, the data from NVMe, the write not flushed is lost.
 - `test_fabric_perf.py`: performance scenarios (see above), with floors about 25 % under the
   rates measured.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
