@@ -427,8 +427,9 @@ talks to the memory server over TCP, out of band (4-byte length, then a JSON obj
 
 - `connect` / `disconnect`: the client gives its queue pair (QPN, first PSN, MAC, IP, UDP source
   port) and its tenant; the server takes a queue pair of the target, writes its context with the
-  protection domain of the tenant, and answers with the QPN of the target and the region of the
-  tenant.
+  protection domain of the tenant, and answers with the QPN of the target, its path MTU and the
+  region of the tenant. The client (the exiom backend of the RoCEPool global address library)
+  sets the path MTU of its queue pair to it.
 - Addresses by key, one region per tenant: `alloc` gives a place for a key (always a new one),
   the client writes the value with RDMA WRITE, `commit` makes it the value of the key; `lookup`
   gives the place of the committed value and a lease: the client reads with one RDMA READ by

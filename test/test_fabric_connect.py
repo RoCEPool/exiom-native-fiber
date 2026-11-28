@@ -27,7 +27,7 @@ from exiom.tier    import *
 from exiom.connect import *
 
 from test.test_fabric_roce import (RoCEDUT, Message, Requester, exchange, pattern, MAC, IP, PAGE,
-    WINDOW_BITS, HOST_MAC, HOST_IP, SPORT, QPN)
+    PMTU, WINDOW_BITS, HOST_MAC, HOST_IP, SPORT, QPN)
 from test.test_fabric_tier import FRAMES, with_host
 from test.fabric_sim       import run_simulation
 
@@ -164,8 +164,8 @@ class TestConnect(unittest.TestCase):
             client = Client(server.address)
             r = client.request(op="connect", tenant="a", qpn=0x33, psn=0x4567, mac=HOST_MAC, ip=HOST_IP, sport=SPORT)
             self.assertTrue(r["ok"])
-            self.assertEqual((r["qpn"], r["rkey"], r["va"], r["length"], r["mac"], r["ip"]),
-                (QPN, RKEY_A, VA_A, 4*PAGE, MAC, IP))
+            self.assertEqual((r["qpn"], r["rkey"], r["va"], r["length"], r["mac"], r["ip"], r["pmtu"]),
+                (QPN, RKEY_A, VA_A, 4*PAGE, MAC, IP, 1024))
             self.assertIn(("set_qp", 0, 1, 0x33, HOST_MAC, HOST_IP, SPORT, 0x4567, 1), m.server.driver.calls)
             a = client.request(op="alloc", tenant="a", key="blk", length=256)
             self.assertTrue(client.request(op="commit", tenant="a", key="blk", version=a["version"])["ok"])
@@ -189,7 +189,7 @@ class TestConnect(unittest.TestCase):
         journal, nvme = Journal(), NVMeStore(PAGE)
         driver  = SimDriver(dut.roce, {n: mem.mem for n, mem in enumerate(dut.mems)}, WINDOW_BITS)
         server  = MemoryServer(driver, FRAMES, PAGE, 16, journal, nvme, qpn_base=QPN)
-        manager = ConnectionManager(server, qps=2, mac=MAC, ip=IP, clock=Clock())
+        manager = ConnectionManager(server, qps=2, mac=MAC, ip=IP, pmtu=PMTU, clock=Clock())
         manager.add_tenant("a", 1, 0, RKEY_A, VA_A, 4*PAGE)
         manager.add_tenant("b", 2, 1, RKEY_B, VA_B, 4*PAGE)
         psn = {"a": 0x1000, "b": 0x8000}
@@ -218,6 +218,7 @@ class TestConnect(unittest.TestCase):
             cb = manager.handle(dict(op="connect", tenant="b", qpn=0x22, psn=psn["b"], mac=HOST_MAC, ip=HOST_IP, sport=SPORT))
             yield from manager.apply()
             self.assertEqual((ca["qpn"], cb["qpn"]), (QPN, QPN + 1))
+            self.assertEqual(ca["pmtu"], dut.roce.pmtu)
             va, vb = pattern(300, salt=1), pattern(520, salt=2)
             yield from put("a", ca["qpn"], 0x21, "kv-0001", va)
             yield from put("b", cb["qpn"], 0x22, "kv-0001", vb) # Same key, other tenant.
