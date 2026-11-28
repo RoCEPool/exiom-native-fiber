@@ -123,7 +123,7 @@ class Requester:
     """RC requester of a network card: sends the packets of ``messages``, at most ``window`` not
     acknowledged, and completes them in order."""
     def __init__(self, messages, psn=0x123456, window=4, timeout=6000, drop_tx=(), drop_rx=(),
-        corrupt_tx=(), ecn_tx=(), pmtu=PMTU):
+        corrupt_tx=(), ecn_tx=(), pmtu=PMTU, dqpn=QPN, host_qpn=HOST_QPN):
         self.messages = messages
         self.packets  = [] # (message, psn, frame, responses expected)
         p = psn
@@ -150,6 +150,8 @@ class Requester:
                 p = (p + 1) & 0xffffff
         self.window     = window
         self.pmtu       = pmtu
+        self.dqpn       = dqpn     # QPN of the target.
+        self.host_qpn   = host_qpn # QPN of the requester.
         self.timeout    = timeout
         self.drop_tx    = set(drop_tx)
         self.drop_rx    = set(drop_rx)
@@ -178,7 +180,7 @@ class Requester:
             done = self.got_responses*self.pmtu
             va, rkey, dlen = reth
             psn, reth = (psn + self.got_responses) & 0xffffff, (va + done, rkey, dlen - done)
-        frame = roce_packet(op, psn, payload, reth=reth, ackreq=ackreq,
+        frame = roce_packet(op, psn, payload, reth=reth, ackreq=ackreq, dqpn=self.dqpn,
             ecn=3 if self.sent in self.ecn_tx else 2)
         if self.sent in self.corrupt_tx:
             frame[60] ^= 0x01
@@ -223,7 +225,7 @@ class Requester:
         if pkt["op"] == ROCE_CNP:
             self.cnps.append(pkt)
             return
-        assert pkt["dqpn"] == HOST_QPN
+        assert pkt["dqpn"] == self.host_qpn
         psn = pkt["psn"]
         def before(a, b): # a < b in PSN order.
             return 0 < ((b - a) & 0xffffff) < 0x800000
