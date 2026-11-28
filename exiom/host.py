@@ -25,9 +25,10 @@ Registers (word addresses; 64-bit values in two words, low first; a table entry 
 registers and written by the write to its ``COMMIT`` register):
 
     0x00 ID (0x6578696f, "exio")
-    0x10-0x18 queue pair: index, valid, dqpn, mac low, mac high, ip, sport, epsn, COMMIT
+    0x10-0x18 queue pair: index, valid, dqpn, mac low, mac high, ip, sport, epsn, COMMIT;
+              0x19 protection domain
     0x20-0x29 memory region: index, valid, rkey, va low, va high, length low, length high, access,
-              base, COMMIT
+              base, COMMIT; 0x2a protection domain
     0x30-0x34 page table: entry, frame low, frame high, resident, COMMIT
     0x38 dirty index (write), 0x39 dirty bit of that entry (read), 0x3a clear it (write)
     0x40 miss (read, takes it): bit 31 valid, [15:0] page table entry
@@ -53,9 +54,10 @@ from exiom.pool   import *
 HOST_ID = 0x6578696f
 
 REG_QP_INDEX, REG_QP_VALID, REG_QP_DQPN, REG_QP_MAC_LO, REG_QP_MAC_HI = 0x10, 0x11, 0x12, 0x13, 0x14
-REG_QP_IP, REG_QP_SPORT, REG_QP_EPSN, REG_QP_COMMIT = 0x15, 0x16, 0x17, 0x18
+REG_QP_IP, REG_QP_SPORT, REG_QP_EPSN, REG_QP_COMMIT, REG_QP_PD = 0x15, 0x16, 0x17, 0x18, 0x19
 REG_MR_INDEX, REG_MR_VALID, REG_MR_RKEY, REG_MR_VA_LO, REG_MR_VA_HI = 0x20, 0x21, 0x22, 0x23, 0x24
 REG_MR_LEN_LO, REG_MR_LEN_HI, REG_MR_ACCESS, REG_MR_BASE, REG_MR_COMMIT = 0x25, 0x26, 0x27, 0x28, 0x29
+REG_MR_PD = 0x2a
 REG_PT_ENTRY, REG_PT_FRAME_LO, REG_PT_FRAME_HI, REG_PT_RESIDENT, REG_PT_COMMIT = 0x30, 0x31, 0x32, 0x33, 0x34
 REG_DIRTY_INDEX, REG_DIRTY, REG_DIRTY_CLEAR = 0x38, 0x39, 0x3a
 REG_MISS = 0x40
@@ -184,6 +186,7 @@ class FabricHost(LiteXModule):
         qp_index, qp_valid, qp_dqpn, qp_ip, qp_sport, qp_epsn = (reg(8, "qp_index"), reg(1, "qp_valid"),
             reg(24, "qp_dqpn"), reg(32, "qp_ip"), reg(16, "qp_sport"), reg(24, "qp_epsn"))
         qp_mac = reg(48, "qp_mac")
+        qp_pd, mr_pd = reg(8, "qp_pd"), reg(8, "mr_pd")
         mr_index, mr_valid, mr_rkey, mr_va, mr_len, mr_access, mr_base = (reg(8, "mr_index"),
             reg(1, "mr_valid"), reg(32, "mr_rkey"), reg(64, "mr_va"), reg(64, "mr_len"),
             reg(2, "mr_access"), reg(16, "mr_base"))
@@ -212,7 +215,7 @@ class FabricHost(LiteXModule):
         writes = {
             REG_QP_INDEX: qp_index, REG_QP_VALID: qp_valid, REG_QP_DQPN: qp_dqpn,
             REG_QP_MAC_LO: lo(qp_mac), REG_QP_MAC_HI: hi(qp_mac), REG_QP_IP: qp_ip,
-            REG_QP_SPORT: qp_sport, REG_QP_EPSN: qp_epsn,
+            REG_QP_SPORT: qp_sport, REG_QP_EPSN: qp_epsn, REG_QP_PD: qp_pd, REG_MR_PD: mr_pd,
             REG_MR_INDEX: mr_index, REG_MR_VALID: mr_valid, REG_MR_RKEY: mr_rkey,
             REG_MR_VA_LO: lo(mr_va), REG_MR_VA_HI: hi(mr_va), REG_MR_LEN_LO: lo(mr_len),
             REG_MR_LEN_HI: hi(mr_len), REG_MR_ACCESS: mr_access, REG_MR_BASE: mr_base,
@@ -229,11 +232,11 @@ class FabricHost(LiteXModule):
             roce.qp_cfg.we.eq(wr & (adr == REG_QP_COMMIT)),
             roce.qp_cfg.index.eq(qp_index), roce.qp_cfg.valid.eq(qp_valid),
             roce.qp_cfg.dqpn.eq(qp_dqpn), roce.qp_cfg.mac.eq(qp_mac), roce.qp_cfg.ip.eq(qp_ip),
-            roce.qp_cfg.sport.eq(qp_sport), roce.qp_cfg.epsn.eq(qp_epsn),
+            roce.qp_cfg.sport.eq(qp_sport), roce.qp_cfg.epsn.eq(qp_epsn), roce.qp_cfg.pd.eq(qp_pd),
             roce.mr_cfg.we.eq(wr & (adr == REG_MR_COMMIT)),
             roce.mr_cfg.index.eq(mr_index), roce.mr_cfg.valid.eq(mr_valid),
             roce.mr_cfg.rkey.eq(mr_rkey), roce.mr_cfg.va.eq(mr_va), roce.mr_cfg.length.eq(mr_len),
-            roce.mr_cfg.access.eq(mr_access), roce.mr_cfg.base.eq(mr_base),
+            roce.mr_cfg.access.eq(mr_access), roce.mr_cfg.base.eq(mr_base), roce.mr_cfg.pd.eq(mr_pd),
             roce.pt_cfg.we.eq(wr & (adr == REG_PT_COMMIT)),
             roce.pt_cfg.adr.eq(pt_entry), roce.pt_cfg.dat.eq(pt_frame),
             roce.pt_cfg.resident.eq(pt_resident),
