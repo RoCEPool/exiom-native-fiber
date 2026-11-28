@@ -1,0 +1,74 @@
+name: resources
+
+# Resource usage of a Fabric node after synthesis (Yosys, UltraScale+ cells), for several sizes of
+# fabric: bench/fabric/resources.py. Started by hand, and when the script or this file changes.
+# The table is in the job summaries and in the fabric-resources artifacts.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "bench/fabric/resources.py"
+      - ".github/workflows/resources.yml"
+
+jobs:
+  synth:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {nodes: 16,  ports: 8}
+          - {nodes: 32,  ports: 8}
+          - {nodes: 128, ports: 9}
+          - {nodes: 128, ports: 11}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install wget build-essential yosys
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: "pip"
+          cache-dependency-path: "setup.py"
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install setuptools
+
+      - name: Install LiteX
+        run: |
+          wget https://raw.githubusercontent.com/enjoy-digital/litex/master/litex_setup.py
+          python3 litex_setup.py --clone-depth=1 init install --user
+
+      - name: Install Project
+        run: python3 setup.py develop --user
+
+      - name: Synthesize
+        run: |
+          yosys -V
+          python3 bench/fabric/resources.py --nodes ${{ matrix.nodes }} --ports ${{ matrix.ports }} \
+            --markdown build/fabric_resources.md --json build/fabric_resources.json
+
+      - name: Report
+        if: always()
+        run: |
+          if [ -f build/fabric_resources.md ]; then
+            cat build/fabric_resources.md
+            cat build/fabric_resources.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabric-resources-${{ matrix.nodes }}-nodes-${{ matrix.ports }}-ports
+          path: build/fabric_resources.*
+          if-no-files-found: ignore
