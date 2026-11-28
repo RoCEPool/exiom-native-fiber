@@ -331,6 +331,45 @@ its network card.
   operation are dropped and counted.
 - Addresses outside the pool are answered with `FABRIC_NODE`.
 
+## RoCE target: RDMA from commodity network cards
+
+`exiom/roce.py`, the first step of the centralized design (GPU servers with their own RDMA network
+cards, memory servers with the fabric). The network cards of the GPU servers are the requesters
+of Reliable Connected queue pairs; `FabricRoCE` is the responder. A READ or a WRITE names a memory
+region (R_Key) and a virtual address; the page table of the region gives the global address of
+each page in the pool, so the pages of a region can be anywhere in the fabric. The memory is
+reached with `FabricPool`.
+
+- RoCEv2 over IPv4 (UDP port 4791): RDMA WRITE FIRST/MIDDLE/LAST/ONLY and RDMA READ REQUEST,
+  answered with ACK, NAK and READ RESPONSE FIRST/MIDDLE/LAST/ONLY. Other opcodes get a NAK
+  "invalid request".
+- PSN: a packet after a missing one gets one NAK "PSN sequence error" and the requester goes back
+  (go-back-N); a duplicate WRITE is acknowledged again without being written; a duplicate READ is
+  run again (the requester asks again when a response is lost).
+- ICRC checked on receive (bad packets dropped and counted) and computed on send; IPv4 header
+  checksum on send, UDP checksum 0.
+- R_Key, range and access (read, write) of the region checked: NAK "remote access error". An
+  error of the fabric (node that does not exist, memory error) gives a NAK "remote operational
+  error". After such a NAK the packet is skipped: the requester ends the message in error.
+- ECN: a packet marked CE makes a CNP to its requester, at most one per `cnp_interval` cycles.
+- Queue pairs, memory regions and page table entries are written by the host (`qp_cfg`, `mr_cfg`,
+  `pt_cfg`); there is no connection manager in the FPGA.
+
+First version, for the protocol and not yet for the throughput:
+
+- One byte per cycle, one word of the pool at a time: a READ takes about 26 cycles per word, a
+  WRITE about 30 (2 nodes, 256-byte packets), so about 35 MB/s at 250 MHz. A network card at
+  200 Gb/s needs a 512-bit data path and many words in flight (bursts of the memory port).
+- Two received frames wait at most: a frame coming while two wait is dropped and counted, and
+  the requester sends it again (sequence NAK or timeout). A requester at full rate goes through
+  this all the time; the tests check that the data is right anyway.
+- Addresses and lengths multiple of 4 bytes (byte `a` of a region is lane `a % 4` of its word).
+- No SEND, immediate data, atomics or requester side; ARP and the queue pair setup are left to
+  the host.
+- The ICRC follows IBA Annex A17 as the Linux software RoCE driver computes it; it is checked here
+  against the software model of the tests only. Talking to a real network card is the check
+  (phase 2 of the plan).
+
 ## Interfaces
 
 - `FabricNode(node_id, size, ports, routes, max_hops, ...)`: one node (`routes`: costs at reset,
@@ -377,7 +416,7 @@ its network card.
 python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_network.py \
     test/test_fabric_copy.py test/test_fabric_burst.py test/test_fabric_address.py \
     test/test_fabric_pipelined.py test/test_fabric_perf.py test/test_fabric_frame.py \
-    test/test_fabric_bench.py test/test_fabric_sim.py
+    test/test_fabric_bench.py test/test_fabric_sim.py test/test_fabric_roce.py
 ```
 
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
@@ -416,6 +455,14 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   copy does not go through the node that receives the frames), errors of the pool in the reply,
   frames that are not commands (other EtherType, other destination, broadcast, cut, unknown
   operation), a command during another one, a reply taken slowly.
+- `test_fabric_roce.py`: RoCE target against a software model of the RC requester of a network
+  card (go-back-N, timeout), the region spread over the pages of node 1 in another order: writes
+  and reads of one and several packets, over two pages, of length 0; packets lost in both
+  directions (a write packet, a read response, an ACK); 12 messages back to back with frames
+  dropped while two wait; NAKs for an unknown R_Key, out of the region (after, before), a
+  read-only region, an address not aligned, SEND, errors of the fabric in a read and a write;
+  bad ICRC, unknown queue pairs, other UDP port and IP dropped without answer; CNP on CE marks;
+  responses taken slowly by the network card.
 - `test_fabric_perf.py`: performance scenarios (see above), with floors about 25 % under the
   rates measured.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
