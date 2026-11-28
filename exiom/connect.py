@@ -12,8 +12,10 @@ server) talks to it over TCP, out of band, before and next to its RDMA traffic:
 
 - ``connect``: the client gives its queue pair (QPN, first PSN, MAC, IP, UDP source port) and its
   tenant; the server takes a queue pair of the target for it, writes its context (with the
-  protection domain of the tenant) and answers with the QPN of the target and the region of the
-  tenant (R_Key, virtual address, length). ``disconnect`` gives the queue pair back.
+  protection domain of the tenant) and answers with the QPN of the target, its path MTU and the
+  region of the tenant (R_Key, virtual address, length). ``disconnect`` gives the queue pair back.
+  The client sets the path MTU of its queue pair to it, so that its network card cuts messages
+  in the packets the target takes (WRITE FIRST/MIDDLE carry exactly one MTU).
 - Addresses by key: a tenant has one region; its space is given out by key. ``alloc`` gives an
   address for a key (a new place, even when the key exists), the client writes the value there
   with RDMA WRITE, then ``commit`` makes it the value of the key. ``lookup`` gives the place of
@@ -105,15 +107,16 @@ class Allocator:
 class ConnectionManager:
     """Connections and keys of the tenants of ``server`` (``MemoryServer``).
 
-    ``qps``: queue pairs of the target. ``mac``, ``ip``: of the target. ``clock``: seconds
+    ``qps``: queue pairs of the target. ``mac``, ``ip``, ``pmtu``: of the target. ``clock``: seconds
     (``time.monotonic``). ``run``: runs a generator of the driver to its end (the driver on
     hardware, a stub in the tests); without it the changes of the target wait in ``actions``
     for ``apply()`` (a simulation runs them).
     """
-    def __init__(self, server, qps, mac, ip, lease=1.0, align=64, clock=time.monotonic, run=None):
+    def __init__(self, server, qps, mac, ip, pmtu=1024, lease=1.0, align=64, clock=time.monotonic, run=None):
         self.server  = server
         self.mac     = mac
         self.ip      = ip
+        self.pmtu    = pmtu
         self.lease   = lease
         self.align   = align
         self.clock   = clock
@@ -185,7 +188,7 @@ class ConnectionManager:
         self._target(self.server.connect(index, m["qpn"], m["mac"], m["ip"], m["sport"], m["psn"],
             tenant["pd"]))
         region = tenant["region"]
-        return dict(qpn=self.server.qpn_base + index, mac=self.mac, ip=self.ip,
+        return dict(qpn=self.server.qpn_base + index, mac=self.mac, ip=self.ip, pmtu=self.pmtu,
             rkey=region["rkey"], va=region["va"], length=region["length"])
 
     def _op_disconnect(self, m):
