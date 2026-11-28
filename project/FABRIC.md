@@ -354,6 +354,8 @@ reached with `FabricPool`.
 - ECN: a packet marked CE makes a CNP to its requester, at most one per `cnp_interval` cycles.
 - Queue pairs, memory regions and page table entries are written by the host (`qp_cfg`, `mr_cfg`,
   `pt_cfg`); there is no connection manager in the FPGA.
+- Protection domains: a queue pair reaches only the regions of its domain (its tenant); the R_Key
+  of a region of another domain is unknown to it (NAK "remote access error").
 - Page table entries have a resident bit. A packet that meets a page not resident is dropped
   without answer and the entry goes to the host (`miss`); the requester sends the packet again.
   A write sets the dirty bit of its page (cleared by the host, `dirty_cfg`). `idle` and `packets`
@@ -418,6 +420,28 @@ PCIe BAR and the DMA of the card:
 One word at a time, as the rest of this first version: the DMA is for the protocol, not for the
 throughput of the PCIe link.
 
+## Connections and addresses by key
+
+`exiom/connect.py`, host software next to the memory tiers. A client (the library of a GPU server)
+talks to the memory server over TCP, out of band (4-byte length, then a JSON object):
+
+- `connect` / `disconnect`: the client gives its queue pair (QPN, first PSN, MAC, IP, UDP source
+  port) and its tenant; the server takes a queue pair of the target, writes its context with the
+  protection domain of the tenant, and answers with the QPN of the target and the region of the
+  tenant.
+- Addresses by key, one region per tenant: `alloc` gives a place for a key (always a new one),
+  the client writes the value with RDMA WRITE, `commit` makes it the value of the key; `lookup`
+  gives the place of the committed value and a lease: the client reads with one RDMA READ by
+  address, and can keep the address for the lease. `free` removes a key.
+- Space given back (freed, or replaced by a commit) is given out again only after the leases of
+  the addresses already given: a kept address never shows another key's value.
+- Journal (a file, each record synced): tenants and key changes. `recover()` rebuilds the
+  committed keys after `MemoryServer.recover()`; allocations not committed are dropped.
+
+This is the "lookup once, then read by address" path measured in RoCEPool (reads by address 1.4
+to 2.4 times faster than by key on the software RDMA emulator). The allocator is first fit with
+merged free ranges, 64-byte aligned.
+
 ## Interfaces
 
 - `FabricNode(node_id, size, ports, routes, max_hops, ...)`: one node (`routes`: costs at reset,
@@ -465,7 +489,7 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
     test/test_fabric_copy.py test/test_fabric_burst.py test/test_fabric_address.py \
     test/test_fabric_pipelined.py test/test_fabric_perf.py test/test_fabric_frame.py \
     test/test_fabric_bench.py test/test_fabric_sim.py test/test_fabric_roce.py \
-    test/test_fabric_tier.py test/test_fabric_host.py
+    test/test_fabric_tier.py test/test_fabric_host.py test/test_fabric_connect.py
 ```
 
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
@@ -520,6 +544,11 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   that does not exist (error, words before it done); the memory tier scenarios again (8 pages on
   4 frames, power loss) with the driver going through the registers and the DMA only, the DMA and
   the RoCE target sharing the pool.
+- `test_fabric_connect.py`: messages, allocator (first fit, merge, double free refused), keys
+  (not visible before commit, new place per version, space held until the leases end, errors),
+  recovery from a journal file (committed keys back, not committed dropped), the exchange over a
+  TCP socket (queue pairs given and given back); with the RoCE target, two tenants storing and
+  reading the same key by address, and a tenant refused on the region of the other.
 - `test_fabric_perf.py`: performance scenarios (see above), with floors about 25 % under the
   rates measured.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes

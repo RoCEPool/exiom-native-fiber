@@ -42,7 +42,8 @@ Handled (first version):
 - ECN: a packet received with CE marks makes a CNP to its requester (congestion notification
   point of DCQCN), at most one every ``cnp_interval`` cycles.
 - Memory regions: R_Key, base virtual address, length, access (bit 0 read, bit 1 write), first
-  entry in the page table. Pages of ``2**page_bits`` bytes.
+  entry in the page table, protection domain. Pages of ``2**page_bits`` bytes. A queue pair only
+  reaches the regions of its protection domain (tenant): the others are unknown R_Keys to it.
 
 Limits of this first version (the throughput is not the goal yet, the data path is one byte per
 cycle and the pool does one word at a time):
@@ -57,9 +58,9 @@ cycle and the pool does one word at a time):
 Configuration (one write per cycle, ``we`` for one cycle):
 
 - ``qp_cfg``: queue pair ``index`` (QPN ``qpn_base + index``): valid, destination QPN, MAC, IP and
-  UDP source port of the requester, expected PSN. Clears its MSN and its message state.
+  UDP source port of the requester, expected PSN, protection domain. Clears its MSN and its message state.
 - ``mr_cfg``: memory region ``index``: valid, R_Key, virtual address, length (bytes), access, first
-  page table entry.
+  page table entry, protection domain.
 - ``pt_cfg``: page table entry ``adr``: global word address of the page.
 """
 
@@ -155,11 +156,11 @@ def roce_frame_layout():
 
 def qp_cfg_layout():
     return [("we", 1), ("index", 8), ("valid", 1), ("dqpn", 24), ("mac", 48), ("ip", 32),
-        ("sport", 16), ("epsn", 24)]
+        ("sport", 16), ("epsn", 24), ("pd", 8)]
 
 def mr_cfg_layout(abits):
     return [("we", 1), ("index", 8), ("valid", 1), ("rkey", 32), ("va", 64), ("length", 64),
-        ("access", 2), ("base", 16)]
+        ("access", 2), ("base", 16), ("pd", 8)]
 
 def pt_cfg_layout(abits):
     return [("we", 1), ("adr", 16), ("dat", abits), ("resident", 1)]
@@ -232,6 +233,7 @@ class FabricRoCE(LiteXModule):
         qp_ip    = table(qps, 32, "qp_ip")
         qp_sport = table(qps, 16, "qp_sport")
         qp_epsn  = table(qps, 24, "qp_epsn")  # Expected PSN.
+        qp_pd    = table(qps, 8,  "qp_pd")    # Protection domain (tenant).
         qp_msn   = table(qps, 24, "qp_msn")   # Messages done.
         qp_nak   = table(qps, 1,  "qp_nak")   # PSN sequence error NAK sent, not yet resolved.
         qp_wact  = table(qps, 1,  "qp_wact")  # WRITE message in progress (FIRST received).
@@ -245,6 +247,7 @@ class FabricRoCE(LiteXModule):
         mr_length = table(mrs, 64, "mr_length")
         mr_access = table(mrs, 2,  "mr_access")
         mr_base   = table(mrs, 16, "mr_base")
+        mr_pd     = table(mrs, 8,  "mr_pd")
 
         self.sync += [
             If(qp_cfg.we,
@@ -254,6 +257,7 @@ class FabricRoCE(LiteXModule):
                 qp_ip[qp_cfg.index].eq(qp_cfg.ip),
                 qp_sport[qp_cfg.index].eq(qp_cfg.sport),
                 qp_epsn[qp_cfg.index].eq(qp_cfg.epsn),
+                qp_pd[qp_cfg.index].eq(qp_cfg.pd),
                 qp_msn[qp_cfg.index].eq(0),
                 qp_nak[qp_cfg.index].eq(0),
                 qp_wact[qp_cfg.index].eq(0),
@@ -265,6 +269,7 @@ class FabricRoCE(LiteXModule):
                 mr_length[mr_cfg.index].eq(mr_cfg.length),
                 mr_access[mr_cfg.index].eq(mr_cfg.access),
                 mr_base[mr_cfg.index].eq(mr_cfg.base),
+                mr_pd[mr_cfg.index].eq(mr_cfg.pd),
             ),
         ]
 
@@ -546,7 +551,7 @@ class FabricRoCE(LiteXModule):
             end = Signal(66, name=f"mr_end{m}")
             self.comb += [
                 end.eq(e.va - mr_va[m] + e.dlen),
-                hits[m].eq(mr_valid[m] & (mr_rkey[m] == e.rkey)),
+                hits[m].eq(mr_valid[m] & (mr_rkey[m] == e.rkey) & (mr_pd[m] == qp_pd[cq])),
                 allowed[m].eq((e.va >= mr_va[m]) & (end <= mr_length[m])),
             ]
         self.comb += If(hits != 0, *[If(hits[m], hit.eq(m)) for m in reversed(range(mrs))])

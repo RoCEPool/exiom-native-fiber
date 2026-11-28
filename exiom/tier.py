@@ -37,6 +37,9 @@ go through the driver of the card). The data of the frames is moved by the drive
 (``read_frame``, ``write_frame``): PCIe DMA on hardware, the memories directly in the tests.
 """
 
+import os
+import json
+
 from collections import OrderedDict
 
 from exiom import host as h
@@ -61,12 +64,27 @@ class NVMeStore:
         self.pages[page] = bytes(data)
 
 class Journal:
-    """Append-only records. Survives a power loss."""
-    def __init__(self):
+    """Append-only records. Survives a power loss: with ``path``, each record is a JSON line of the
+    file, written and synced before ``append`` returns (``load`` reads them back)."""
+    def __init__(self, path=None):
         self.records = []
+        self.path    = path
 
     def append(self, record):
         self.records.append(dict(record))
+        if self.path is not None:
+            with open(self.path, "a") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+    @classmethod
+    def load(cls, path):
+        journal = cls(path)
+        if os.path.exists(path):
+            with open(path) as f:
+                journal.records = [json.loads(line) for line in f if line.strip()]
+        return journal
 
 # Driver (simulation) ------------------------------------------------------------------------------
 
@@ -85,13 +103,13 @@ class SimDriver:
         yield
         yield record.we.eq(0)
 
-    def set_qp(self, index, valid, dqpn, mac, ip, sport, epsn):
+    def set_qp(self, index, valid, dqpn, mac, ip, sport, epsn, pd=0):
         yield from self._write(self.roce.qp_cfg, index=index, valid=valid, dqpn=dqpn, mac=mac, ip=ip,
-            sport=sport, epsn=epsn)
+            sport=sport, epsn=epsn, pd=pd)
 
-    def set_mr(self, index, valid, rkey, va, length, access, base):
+    def set_mr(self, index, valid, rkey, va, length, access, base, pd=0):
         yield from self._write(self.roce.mr_cfg, index=index, valid=valid, rkey=rkey, va=va,
-            length=length, access=access, base=base)
+            length=length, access=access, base=base, pd=pd)
 
     def set_pt(self, entry, frame, resident):
         yield from self._write(self.roce.pt_cfg, adr=entry, dat=frame, resident=resident)
@@ -171,12 +189,13 @@ class MemoryServer:
 
     # Regions.
 
-    def region(self, index, rkey, va, length, access):
-        """Memory region ``index``: its pages, not resident. Returns the record."""
+    def region(self, index, rkey, va, length, access, pd=0):
+        """Memory region ``index`` of protection domain ``pd``: its pages, not resident. Returns
+        the record."""
         pages = -(-length // self.page_bytes)
         assert self.next_entry + pages <= self.pt_entries, "Page table full."
         record = dict(kind="region", index=index, rkey=rkey, va=va, length=length, access=access,
-            base=self.next_entry, nvme=self.next_page, pages=pages)
+            base=self.next_entry, nvme=self.next_page, pages=pages, pd=pd)
         self.journal.append(record)
         yield from self._install(record)
         return record
@@ -190,7 +209,7 @@ class MemoryServer:
         self.next_entry = max(self.next_entry, record["base"] + record["pages"])
         self.next_page  = max(self.next_page, record["nvme"] + record["pages"])
         yield from self.driver.set_mr(record["index"], 1, record["rkey"], record["va"],
-            record["length"], record["access"], record["base"])
+            record["length"], record["access"], record["base"], record.get("pd", 0))
 
     def pin(self, entry, pinned=True):
         """A pinned page is never evicted (a KV block in use)."""
@@ -198,9 +217,9 @@ class MemoryServer:
 
     # Queue pairs.
 
-    def connect(self, index, dqpn, mac, ip, sport, epsn):
+    def connect(self, index, dqpn, mac, ip, sport, epsn, pd=0):
         """Context of queue pair ``index`` from the connection exchange; returns its QPN."""
-        yield from self.driver.set_qp(index, 1, dqpn, mac, ip, sport, epsn)
+        yield from self.driver.set_qp(index, 1, dqpn, mac, ip, sport, epsn, pd)
         return self.qpn_base + index
 
     # Tiers.
@@ -276,16 +295,16 @@ class CardDriver:
         for adr, value in values:
             yield from self.bus.write(adr, value & 0xffffffff)
 
-    def set_qp(self, index, valid, dqpn, mac, ip, sport, epsn):
+    def set_qp(self, index, valid, dqpn, mac, ip, sport, epsn, pd=0):
         yield from self._regs([(h.REG_QP_INDEX, index), (h.REG_QP_VALID, valid), (h.REG_QP_DQPN, dqpn),
             (h.REG_QP_MAC_LO, mac), (h.REG_QP_MAC_HI, mac >> 32), (h.REG_QP_IP, ip),
-            (h.REG_QP_SPORT, sport), (h.REG_QP_EPSN, epsn), (h.REG_QP_COMMIT, 1)])
+            (h.REG_QP_SPORT, sport), (h.REG_QP_EPSN, epsn), (h.REG_QP_PD, pd), (h.REG_QP_COMMIT, 1)])
 
-    def set_mr(self, index, valid, rkey, va, length, access, base):
+    def set_mr(self, index, valid, rkey, va, length, access, base, pd=0):
         yield from self._regs([(h.REG_MR_INDEX, index), (h.REG_MR_VALID, valid), (h.REG_MR_RKEY, rkey),
             (h.REG_MR_VA_LO, va), (h.REG_MR_VA_HI, va >> 32), (h.REG_MR_LEN_LO, length),
             (h.REG_MR_LEN_HI, length >> 32), (h.REG_MR_ACCESS, access), (h.REG_MR_BASE, base),
-            (h.REG_MR_COMMIT, 1)])
+            (h.REG_MR_PD, pd), (h.REG_MR_COMMIT, 1)])
 
     def set_pt(self, entry, frame, resident):
         yield from self._regs([(h.REG_PT_ENTRY, entry), (h.REG_PT_FRAME_LO, frame),
