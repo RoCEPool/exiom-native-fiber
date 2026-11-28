@@ -19,10 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {nodes: 16,  ports: 8}
-          - {nodes: 32,  ports: 8}
-          - {nodes: 128, ports: 9}
-          - {nodes: 128, ports: 11}
+          - {nodes: 16,  ports: 8,  hours: false}
+          - {nodes: 32,  ports: 8,  hours: false}
+          # About two hours each: only when started by hand.
+          - {nodes: 128, ports: 9,  hours: true}
+          - {nodes: 128, ports: 11, hours: true}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,6 +53,7 @@ jobs:
         run: python3 setup.py develop --user
 
       - name: Synthesize
+        if: ${{ !matrix.hours || github.event_name == 'workflow_dispatch' }}
         run: |
           yosys -V
           python3 bench/fabric/resources.py --nodes ${{ matrix.nodes }} --ports ${{ matrix.ports }} \

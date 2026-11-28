@@ -91,16 +91,23 @@ CELLS = {
     "MUXF"   : r"MUXF\w+",
 }
 
+# LUTs of a LUT RAM cell (the others: 1).
+LUTRAM_LUTS = {"RAM32M": 4, "RAM64M": 4, "RAM32M16": 8, "RAM64M8": 8, "RAM32X1D": 2, "RAM64X1D": 2,
+    "RAM128X1D": 4, "RAM256X1D": 8}
+
 def parse_stat(stat):
     """Cell counts from the Yosys stat report, with "<cell> <count>" lines (older Yosys) or
-    "<count> <cell>" lines (newer Yosys)."""
+    "<count> <cell>" lines (newer Yosys). ``LUTRAM``: LUTs used as memory; ``CELLS``: every cell
+    counted."""
     results = {k: 0 for k in CELLS}
+    results["CELLS"] = {}
     cells   = re.findall(r"^\s+(\S+)\s+(\d+)\s*$", stat, re.M)
     cells  += [(cell, count) for count, cell in re.findall(r"^\s+(\d+)\s+(\S+)\s*$", stat, re.M)]
     for cell, count in cells:
         for k, pattern in CELLS.items():
             if re.fullmatch(pattern, cell):
-                results[k] += int(count)
+                results[k] += int(count)*(LUTRAM_LUTS.get(cell, 1) if k == "LUTRAM" else 1)
+                results["CELLS"][cell] = int(count)
     return results
 
 def parse_ltp(ltp):
@@ -168,10 +175,12 @@ def main():
             print(f"{name:34s}" + "".join(f"{str(r[k]):>10s}" for k in COLUMNS) + f"{r['LUT%']:>8}{r['FF%']:>8}{r['TIME']:>7}s", flush=True)
             rows.append([name] + [r[k] for k in COLUMNS] + [r["LUT%"], r["FF%"], r["FAMILY"]])
 
+    for path in [args.json, args.markdown]:
+        if path:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     if args.json:
         json.dump(results, open(args.json, "w"), indent=2)
     if args.markdown:
-        os.makedirs(os.path.dirname(args.markdown) or ".", exist_ok=True)
         new = not os.path.exists(args.markdown)
         with open(args.markdown, "a") as f:
             if new:
