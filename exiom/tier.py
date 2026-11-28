@@ -39,6 +39,8 @@ go through the driver of the card). The data of the frames is moved by the drive
 
 from collections import OrderedDict
 
+from exiom import host as h
+
 # Persistent layer (model) -------------------------------------------------------------------------
 
 class NVMeStore:
@@ -255,3 +257,85 @@ class MemoryServer:
             if record["kind"] == "region":
                 yield from server._install(record)
         return server
+
+# Driver (card registers and DMA) ------------------------------------------------------------------
+
+class CardDriver:
+    """Access to the card through its registers and its DMA (``FabricHost``), as the driver on
+    hardware: ``bus``: register reads and writes (``read(adr)``, ``write(adr, value)``, generators:
+    PCIe BAR on hardware, the Wishbone of the simulation in the tests); ``cpu``: words of the host
+    memory read and written by the CPU (``read(word)``, ``write(word, value)``); ``buffer``: word
+    address in the host memory of the bounce buffer of the DMA (one page)."""
+    def __init__(self, bus, cpu, buffer, timeout=1000000):
+        self.bus     = bus
+        self.cpu     = cpu
+        self.buffer  = buffer
+        self.timeout = timeout
+
+    def _regs(self, values):
+        for adr, value in values:
+            yield from self.bus.write(adr, value & 0xffffffff)
+
+    def set_qp(self, index, valid, dqpn, mac, ip, sport, epsn):
+        yield from self._regs([(h.REG_QP_INDEX, index), (h.REG_QP_VALID, valid), (h.REG_QP_DQPN, dqpn),
+            (h.REG_QP_MAC_LO, mac), (h.REG_QP_MAC_HI, mac >> 32), (h.REG_QP_IP, ip),
+            (h.REG_QP_SPORT, sport), (h.REG_QP_EPSN, epsn), (h.REG_QP_COMMIT, 1)])
+
+    def set_mr(self, index, valid, rkey, va, length, access, base):
+        yield from self._regs([(h.REG_MR_INDEX, index), (h.REG_MR_VALID, valid), (h.REG_MR_RKEY, rkey),
+            (h.REG_MR_VA_LO, va), (h.REG_MR_VA_HI, va >> 32), (h.REG_MR_LEN_LO, length),
+            (h.REG_MR_LEN_HI, length >> 32), (h.REG_MR_ACCESS, access), (h.REG_MR_BASE, base),
+            (h.REG_MR_COMMIT, 1)])
+
+    def set_pt(self, entry, frame, resident):
+        yield from self._regs([(h.REG_PT_ENTRY, entry), (h.REG_PT_FRAME_LO, frame),
+            (h.REG_PT_FRAME_HI, frame >> 32), (h.REG_PT_RESIDENT, resident), (h.REG_PT_COMMIT, 1)])
+
+    def dirty(self, entry):
+        yield from self.bus.write(h.REG_DIRTY_INDEX, entry)
+        return (yield from self.bus.read(h.REG_DIRTY))
+
+    def clear_dirty(self, entry):
+        yield from self._regs([(h.REG_DIRTY_INDEX, entry), (h.REG_DIRTY_CLEAR, 1)])
+
+    def misses(self):
+        entries = []
+        while True:
+            value = yield from self.bus.read(h.REG_MISS)
+            if not value >> 31:
+                return entries
+            entries.append(value & 0xffff)
+
+    def quiesce(self):
+        done = yield from self.bus.read(h.REG_PACKETS)
+        while not (yield from self.bus.read(h.REG_IDLE)):
+            if (yield from self.bus.read(h.REG_PACKETS)) != done:
+                break
+
+    def counter(self, name):
+        return (yield from self.bus.read(h.REG_COUNTERS + h.COUNTERS.index(name)))
+
+    def dma(self, host_word, gadr, words, direction):
+        """One DMA transfer; returns (status, words done)."""
+        yield from self._regs([(h.REG_DMA_HOST_LO, host_word), (h.REG_DMA_HOST_HI, host_word >> 32),
+            (h.REG_DMA_GADR_LO, gadr), (h.REG_DMA_GADR_HI, gadr >> 32), (h.REG_DMA_WORDS, words),
+            (h.REG_DMA_DIR, direction), (h.REG_DMA_START, 1)])
+        for _ in range(self.timeout):
+            status = yield from self.bus.read(h.REG_DMA_STATUS)
+            if not status & 1:
+                return (status >> 4) & 0xf, (yield from self.bus.read(h.REG_DMA_DONE))
+        raise TimeoutError("DMA not done.")
+
+    def read_frame(self, frame, length):
+        status, done = yield from self.dma(self.buffer, frame, length//4, h.DMA_TO_HOST)
+        assert status == 0, f"DMA error {status} after {done} words."
+        data = bytearray()
+        for i in range(length//4):
+            data += (yield from self.cpu.read(self.buffer + i)).to_bytes(4, "little")
+        return bytes(data)
+
+    def write_frame(self, frame, data):
+        for i in range(len(data)//4):
+            yield from self.cpu.write(self.buffer + i, int.from_bytes(data[4*i:4*i + 4], "little"))
+        status, done = yield from self.dma(self.buffer, frame, len(data)//4, h.DMA_TO_FABRIC)
+        assert status == 0, f"DMA error {status} after {done} words."

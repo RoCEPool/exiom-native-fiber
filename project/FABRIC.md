@@ -396,8 +396,27 @@ layer): each page of a region has a place on NVMe, and a frame (DRAM page) while
 A READ dropped on a miss is run again when the requester sends it again, maybe after the messages
 sent after it: like any READ run again in RC it can see their writes, so a client that writes
 bytes it has just asked to read fences the write (`IBV_SEND_FENCE`). Eviction is first in, first
-out (the target does not report the pages used); the frames are moved directly in the memories
-in the tests (PCIe DMA on hardware, not written yet).
+out (the target does not report the pages used). `SimDriver` moves the frames directly in the
+memories; `CardDriver` moves them with the DMA of the card (see Host channel).
+
+## Host channel: registers and DMA of the card
+
+`exiom/host.py`. The host of a memory server reaches the card only through it, as through the
+PCIe BAR and the DMA of the card:
+
+- `FabricHost.bus`: Wishbone slave with the registers of the RoCE target (queue pairs, memory
+  regions, page table entries staged then committed, dirty bits, misses taken by reading them,
+  counters) and of the DMA. The register map is in the module. On hardware it goes behind the
+  PCIe BAR (LitePCIe, not connected yet).
+- DMA: words between the host memory and global addresses of the pool, one transfer at a time,
+  with the first error of the pool and the words done. `FabricHost.host` is the host memory side
+  (PCIe on hardware); `HostMemory` is its model, with a latency per word.
+- `PoolArbiter`: the pool of the node shared by the RoCE target and the DMA, in turn.
+- `CardDriver` (`exiom/tier.py`): the driver, with the interface of `SimDriver`: the memory tiers
+  run on it unchanged, pages moved through a bounce buffer in the host memory.
+
+One word at a time, as the rest of this first version: the DMA is for the protocol, not for the
+throughput of the PCIe link.
 
 ## Interfaces
 
@@ -446,7 +465,7 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
     test/test_fabric_copy.py test/test_fabric_burst.py test/test_fabric_address.py \
     test/test_fabric_pipelined.py test/test_fabric_perf.py test/test_fabric_frame.py \
     test/test_fabric_bench.py test/test_fabric_sim.py test/test_fabric_roce.py \
-    test/test_fabric_tier.py
+    test/test_fabric_tier.py test/test_fabric_host.py
 ```
 
 - `test_topology.py`: two-tier sizes (2 to 32 nodes), growth only adds cables, costs, paths left
@@ -497,6 +516,10 @@ python3 -m pytest -v test/test_topology.py test/test_fabric.py test/test_fabric_
   (misses, evictions, write backs, a pinned page never evicted, the data right in memory and on
   NVMe); power loss after flushes and a write not flushed: on a fresh target the regions come back
   from the journal, the data from NVMe, the write not flushed is lost.
+- `test_fabric_host.py`: host channel: identification, DMA both ways, DMA running into a node
+  that does not exist (error, words before it done); the memory tier scenarios again (8 pages on
+  4 frames, power loss) with the driver going through the registers and the DMA only, the DMA and
+  the RoCE target sharing the pool.
 - `test_fabric_perf.py`: performance scenarios (see above), with floors about 25 % under the
   rates measured.
 - `test_fabric_bench.py`: the benches of `bench/fabric/sim.py` with the Migen simulator: two nodes
