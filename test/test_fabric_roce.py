@@ -108,13 +108,14 @@ def parse_packet(frame):
 # Requester (software model) -----------------------------------------------------------------------
 
 class Message:
-    def __init__(self, kind, va, data=b"", length=0, rkey=RKEY, opcode=None):
+    def __init__(self, kind, va, data=b"", length=0, rkey=RKEY, opcode=None, fence=False):
         self.kind   = kind   # "write", "read" or "raw" (one packet, given opcode, answered by ACK/NAK).
         self.va     = va
         self.data   = data
         self.length = length if kind == "read" else len(data)
         self.rkey   = rkey
         self.opcode = opcode
+        self.fence  = fence  # Sent once the messages before it are completed (IBV_SEND_FENCE).
         self.result = None   # Syndrome of the completion.
         self.got    = bytearray()
 
@@ -148,6 +149,7 @@ class Requester:
                 self.packets.append([m, p, (m.opcode, m.data, (m.va, m.rkey, m.length)), 1])
                 p = (p + 1) & 0xffffff
         self.window     = window
+        self.pmtu       = pmtu
         self.timeout    = timeout
         self.drop_tx    = set(drop_tx)
         self.drop_rx    = set(drop_rx)
@@ -168,7 +170,14 @@ class Requester:
 
     def frame(self, index):
         m, psn, (op, payload, reth), _ = self.packets[index]
-        ackreq = 1 if op in (ROCE_WRITE_LAST, ROCE_WRITE_ONLY) else 0
+        # AckReq on the last packet of a message and on the last one of a window (the writes
+        # are acknowledged as they go).
+        ackreq = 1 if op in (ROCE_WRITE_LAST, ROCE_WRITE_ONLY) or (index + 1) % self.window == 0 else 0
+        if op == ROCE_READ_REQUEST and index == self.una and self.got_responses:
+            # Read sent again after some responses: from the first missing one.
+            done = self.got_responses*self.pmtu
+            va, rkey, dlen = reth
+            psn, reth = (psn + self.got_responses) & 0xffffff, (va + done, rkey, dlen - done)
         frame = roce_packet(op, psn, payload, reth=reth, ackreq=ackreq,
             ecn=3 if self.sent in self.ecn_tx else 2)
         if self.sent in self.corrupt_tx:
@@ -179,16 +188,19 @@ class Requester:
 
     def next_frame(self):
         """Next frame to send (None: nothing to send, or the frame is lost)."""
-        if self.next < len(self.packets) and self.next - self.una < self.window:
+        fenced = (self.next < len(self.packets) and self.packets[self.next][0].fence and
+            self.next > self.una and self.packets[self.next - 1][0] is not self.packets[self.next][0])
+        if self.next < len(self.packets) and self.next - self.una < self.window and not fenced:
             frame = self.frame(self.next)
             self.next += 1
             return frame, True
         return None, False
 
     def go_back(self):
+        # The responses of a read already received are kept: it is sent again from the first
+        # missing one.
         self.retransmits += 1
         self.next = self.una
-        self.got_responses = 0
         self.back_pending = True
 
     def complete(self, result):
@@ -234,6 +246,7 @@ class Requester:
                 m.result = pkt["syn"]
                 while not self.done() and self.packets[self.una][0] is m:
                     self.una += 1
+                self.got_responses = 0
                 self.go_back()
         elif pkt["op"] == ROCE_ACK:
             # Coalesced ACK: the writes up to ``psn``; a read before it not answered is missing.
@@ -293,11 +306,13 @@ def configure(dut, pages=PAGES, extra=()):
     for i, page in enumerate(pages):
         yield roce.pt_cfg.adr.eq(i)
         yield roce.pt_cfg.dat.eq(page)
+        yield roce.pt_cfg.resident.eq(1)
         yield roce.pt_cfg.we.eq(1)
         yield
     for i, node in extra:
         yield roce.pt_cfg.adr.eq(i)
         yield roce.pt_cfg.dat.eq(node)
+        yield roce.pt_cfg.resident.eq(1)
         yield roce.pt_cfg.we.eq(1)
         yield
     yield roce.pt_cfg.we.eq(0)

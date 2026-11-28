@@ -162,7 +162,13 @@ def mr_cfg_layout(abits):
         ("access", 2), ("base", 16)]
 
 def pt_cfg_layout(abits):
-    return [("we", 1), ("adr", 16), ("dat", abits)]
+    return [("we", 1), ("adr", 16), ("dat", abits), ("resident", 1)]
+
+def dirty_cfg_layout():
+    return [("we", 1), ("adr", 16)]
+
+def miss_layout():
+    return [("entry", 16)]
 
 def packet_layout():
     """Header fields of a received packet, with its buffer slot and length."""
@@ -189,6 +195,7 @@ class FabricRoCE(LiteXModule):
         self.qp_cfg = qp_cfg = Record(qp_cfg_layout())
         self.mr_cfg = mr_cfg = Record(mr_cfg_layout(abits))
         self.pt_cfg = pt_cfg = Record(pt_cfg_layout(abits))
+        self.dirty_cfg = dirty_cfg = Record(dirty_cfg_layout())
 
         # Status.
         self.rx_packets  = rx_packets  = Signal(32) # Packets for this target with a good ICRC.
@@ -202,6 +209,9 @@ class FabricRoCE(LiteXModule):
         self.acks        = acks        = Signal(32) # ACKs sent.
         self.naks        = naks        = Signal(32) # NAKs sent.
         self.cnps        = cnps        = Signal(32) # CNPs sent.
+        self.misses      = misses      = Signal(32) # Packets dropped on a page not resident.
+        self.packets     = packets     = Signal(32) # Packets done (answered or dropped).
+        self.idle        = Signal()                 # No packet being processed.
 
         # # #
 
@@ -258,15 +268,24 @@ class FabricRoCE(LiteXModule):
             ),
         ]
 
-        pt      = Memory(abits, pt_entries)
+        pt      = Memory(abits + 1, pt_entries) # Resident bit, global word address of the page.
         pt_wr   = pt.get_port(write_capable=True)
         pt_rd   = pt.get_port()
         self.specials += pt, pt_wr, pt_rd
         self.comb += [
             pt_wr.we.eq(pt_cfg.we),
             pt_wr.adr.eq(pt_cfg.adr),
-            pt_wr.dat_w.eq(pt_cfg.dat),
+            pt_wr.dat_w.eq(Cat(pt_cfg.dat, pt_cfg.resident)),
         ]
+
+        # Pages written since the host cleared their bit (a write clears after: it stays set).
+        self.dirty = dirty = Array(Signal(name=f"dirty{i}") for i in range(pt_entries))
+        self.sync += If(dirty_cfg.we, dirty[dirty_cfg.adr].eq(0))
+
+        # Pages not resident met: entries for the host, which brings them in and makes them
+        # resident; the requester sends the packet again (timeout or sequence NAK).
+        self.miss_fifo = miss_fifo = stream.SyncFIFO(miss_layout(), 8)
+        self.miss = miss_fifo.source
 
         # Receive: frame bytes into a buffer slot, header fields, ICRC.
         # --------------------------------------------------------------
@@ -546,10 +565,14 @@ class FabricRoCE(LiteXModule):
         cmr  = Signal(mr_bits)
         off  = Signal(64)
         gadr = Signal(abits)
+        entry    = Signal(16)
+        resident = Signal()
         self.comb += [
             off.eq(cva - mr_va[cmr]),
-            pt_rd.adr.eq(mr_base[cmr] + off[page_bits:]),
-            gadr.eq(pt_rd.dat_r + off[2:page_bits]),
+            entry.eq(mr_base[cmr] + off[page_bits:]),
+            pt_rd.adr.eq(entry),
+            gadr.eq(pt_rd.dat_r[:abits] + off[2:page_bits]),
+            resident.eq(pt_rd.dat_r[abits]),
         ]
 
         # Buffer read of the payload word at byte ``boff`` of the slot.
@@ -606,6 +629,7 @@ class FabricRoCE(LiteXModule):
             return [NextValue(qp_epsn[cq], next_psn), NextValue(qp_wact[cq], 0)] + nak(syndrome, psn)
 
         self.fsm = fsm = FSM(reset_state="IDLE")
+        self.comb += self.idle.eq(fsm.ongoing("IDLE") & ~e.valid)
         fsm.act("IDLE",
             If(e.valid,
                 NextValue(cq, q),
@@ -701,13 +725,18 @@ class FabricRoCE(LiteXModule):
             If(k == 4, NextState("WRITE-POOL"))
         )
         fsm.act("WRITE-POOL",
-            pool.sink.valid.eq(1),
+            If(~resident,
+                NextState("MISS")
+            ).Else(
+                pool.sink.valid.eq(1),
+                pool.source.ready.eq(1),
+            ),
             pool.sink.op.eq(POOL_WRITE),
-            pool.source.ready.eq(1),
             If(pool.source.valid,
                 If(pool.source.status != FABRIC_OK,
                     *fatal(ROCE_NAK_OPERATION, e.psn, e.psn + 1)
                 ).Else(
+                    NextValue(dirty[entry], 1),
                     NextValue(cva,    cva + 4),
                     NextValue(boff,   boff + 4),
                     NextValue(nwords, nwords - 1),
@@ -756,9 +785,13 @@ class FabricRoCE(LiteXModule):
             If(rj == rwords, NextState("READ-SEND")).Else(NextState("READ-POOL"))
         )
         fsm.act("READ-POOL",
-            pool.sink.valid.eq(1),
+            If(~resident,
+                NextState("MISS")
+            ).Else(
+                pool.sink.valid.eq(1),
+                pool.source.ready.eq(1),
+            ),
             pool.sink.op.eq(POOL_READ),
-            pool.source.ready.eq(1),
             If(pool.source.valid,
                 If(pool.source.status != FABRIC_OK,
                     *nak(ROCE_NAK_OPERATION, rpsn)
@@ -798,8 +831,17 @@ class FabricRoCE(LiteXModule):
                 )
             )
         )
+        fsm.act("MISS",
+            # The packet is dropped: no answer, the PSN expected does not move for a WRITE (for a
+            # READ the requester sends it again as a duplicate, run again).
+            miss_fifo.sink.valid.eq(1),
+            miss_fifo.sink.entry.eq(entry),
+            NextValue(misses, misses + 1),
+            NextState("POP")
+        )
         fsm.act("POP",
             e.ready.eq(1),
+            NextValue(packets, packets + 1),
             NextValue(cnp_done, 0),
             NextState("IDLE")
         )
